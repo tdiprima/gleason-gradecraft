@@ -39,11 +39,18 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-# Fix CUDA multiprocessing issue - must be set before CUDA initialization
-try:
-    mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass  # Already set
+# =============================================================================
+# MULTIPROCESSING SETUP (must be before any CUDA operations)
+# =============================================================================
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+# This must happen before any CUDA tensors are created
+if __name__ == "__main__" or mp.current_process().name == "MainProcess":
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
 
 # =============================================================================
 # GPU AND CPU CONFIGURATION
@@ -119,9 +126,9 @@ class Config:
     RANDOM_SEED = 42
 
     # Hardware configuration
-    NUM_WORKERS = 64  # Number of CPU workers for data loading (you have 68 cores)
+    # NOTE: With CUDA + multiprocessing, fewer workers is often more stable
+    NUM_WORKERS = 8  # Reduced from 64 to avoid CUDA pickling issues
     PIN_MEMORY = True  # Faster GPU transfer when True
-    PREFETCH_FACTOR = 4  # Batches to prefetch per worker
 
     # Training defaults (Optuna will override these)
     DEFAULT_BATCH_SIZE = 64  # Larger batch for GPU efficiency
@@ -397,19 +404,16 @@ def create_dataloaders(
         ],
     )
 
-    # Create dataloaders with optimized settings for GPU training
+    # Create dataloaders
+    # NOTE: persistent_workers=False to avoid CUDA pickling issues
+    # NOTE: pin_memory=True still helps with CPU->GPU transfer
     dls = dblock.dataloaders(
         combined_df,
         bs=batch_size,
         num_workers=config.NUM_WORKERS,
         pin_memory=config.PIN_MEMORY,
-        prefetch_factor=config.PREFETCH_FACTOR,
-        persistent_workers=True,  # Keep workers alive between epochs
+        persistent_workers=False,  # MUST be False to avoid CUDA pickling errors
     )
-
-    # NOTE: Don't call dls.cuda() here - it creates CUDA state that breaks pickling with workers
-    # FastAI's learner will automatically move batches to GPU during training
-    # The pin_memory=True setting handles efficient CPU->GPU transfer
 
     return dls
 

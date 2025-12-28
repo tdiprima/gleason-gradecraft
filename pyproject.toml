@@ -15,20 +15,35 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "optuna-integration[fastaiv2]",
+    "torch>=2.6.0",
+    "torchvision>=0.15.0",
 ]
 
 # PyTorch with CUDA must be installed from PyTorch's index, not PyPI
 # The packages below are excluded from normal dependencies and installed via uv/pip with --extra-index-url
 
 [tool.uv]
-# For Grace Hopper (aarch64 + CUDA 12.x), use PyTorch's CUDA builds
-extra-index-url = ["https://download.pytorch.org/whl/cu124"]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cuda" }
-torchvision = { index = "pytorch-cuda" }
+# Ensure wheels exist for Linux ARM (aarch64) platform
+required-environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
 
 [[tool.uv.index]]
-name = "pytorch-cuda"
+name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  # Use CUDA 12.4 wheels on x86_64 Linux or Windows
+  { index = "pytorch-cu124", marker = "(sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'win32'" },
+  # Use CUDA 12.6 wheels on Linux aarch64 (ARM)
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }
+]
+torchvision = [
+  { index = "pytorch-cu124", marker = "(sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'win32'" },
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }
+]

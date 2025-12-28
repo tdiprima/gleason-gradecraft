@@ -24,7 +24,6 @@ from typing import Optional, Tuple
 
 import matplotlib.pyplot as plt
 import mlflow
-import mlflow.fastai
 import optuna
 import pandas as pd
 import seaborn as sns

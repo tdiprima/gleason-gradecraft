@@ -369,9 +369,9 @@ def create_dataloaders(
         persistent_workers=True,  # Keep workers alive between epochs
     )
 
-    # Move to GPU
-    if HAS_GPU:
-        dls = dls.cuda()
+    # NOTE: Don't call dls.cuda() here - it creates CUDA state that breaks pickling with workers
+    # FastAI's learner will automatically move batches to GPU during training
+    # The pin_memory=True setting handles efficient CPU->GPU transfer
 
     return dls
 

@@ -17,7 +17,7 @@ A complete pipeline for training a Gleason score classifier using **FastAI**, **
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ### 2. Organize Your Images
@@ -69,12 +69,15 @@ mlflow ui --backend-store-uri ./mlruns
 ```
 
 **Output files in `./output/`:**
+
 - `gleason_classifier_final.pkl` - Trained model (use with `fastai.load_learner()`)
 - `confusion_matrix.png` - Visual confusion matrix
 - `classification_report.json` - Per-class precision/recall/F1
 - `train_split.csv`, `valid_split.csv`, `test_split.csv` - Data splits for reproducibility
 
 ## Using the Trained Model
+
+### Option 1: FastAI (.pkl) - Easy Python inference
 
 ```python
 from fastai.vision.all import *
@@ -85,6 +88,58 @@ learn = load_learner('output/gleason_classifier_final.pkl')
 # Predict on new image
 pred_class, pred_idx, probs = learn.predict('path/to/new_image.png')
 print(f"Predicted: {pred_class} (confidence: {probs[pred_idx]:.2%})")
+```
+
+### Option 2: TorchScript (.pt) - Production deployment
+
+TorchScript models are better for production:
+
+- No FastAI/Python dependency at inference
+- Can run in C++, Java, mobile (via PyTorch Mobile)
+- Optimized and smaller file size
+
+```python
+import torch
+from torchvision import transforms
+from PIL import Image
+import json
+
+# Load model and labels
+model = torch.jit.load('output/gleason_classifier_final.pt')
+model.eval()
+
+with open('output/class_labels.json') as f:
+    labels = json.load(f)
+
+# Preprocessing (must match training)
+transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Predict
+img = Image.open('test_image.png').convert('RGB')
+input_tensor = transform(img).unsqueeze(0)
+
+with torch.no_grad():
+    output = model(input_tensor)
+    pred_idx = output.argmax(dim=1).item()
+    confidence = torch.softmax(output, dim=1)[0, pred_idx].item()
+
+print(f"Predicted: {labels[str(pred_idx)]} ({confidence:.1%})")
+```
+
+### Option 3: GPU inference with TorchScript
+
+```python
+model = torch.jit.load('output/gleason_classifier_final.pt')
+model = model.cuda()
+input_tensor = transform(img).unsqueeze(0).cuda()
+
+with torch.no_grad():
+    output = model(input_tensor)
 ```
 
 ## Hyperparameters Tuned by Optuna
@@ -119,13 +174,39 @@ learn.loss_func = CrossEntropyLossFlat(weight=class_weights)
 
 ## GPU Support
 
-The script automatically uses GPU if available (CUDA). For CPU-only training, it works but will be slower.
+The script is **optimized for GPU training** with:
 
-Check GPU availability:
+- **Mixed precision (FP16)** - 2x faster training on modern GPUs
+- **cuDNN benchmark mode** - automatically finds fastest convolution algorithms
+- **TF32 support** - enabled for Ampere+ GPUs (RTX 30xx, A100, etc.)
+- **Large batch sizes** - Optuna searches 32, 64, 128, 256
+
+### Hardware Configuration
+
+The script is configured for **64 CPU workers** for data loading. Edit these in `Config` if needed:
+
+```python
+class Config:
+    NUM_WORKERS = 64       # CPU workers for data loading (set to cores - 4)
+    PIN_MEMORY = True      # Faster GPU transfer
+    PREFETCH_FACTOR = 4    # Batches to prefetch per worker
+    USE_FP16 = True        # Mixed precision training
+```
+
+### Verify GPU detection
 
 ```python
 import torch
 print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+```
+
+At startup, the script prints hardware info:
+
+```
+🖥️  GPU: NVIDIA A100-SXM4-80GB (80.0 GB) x 1
+💻 CPU cores available: 72
 ```
 
 ## Troubleshooting

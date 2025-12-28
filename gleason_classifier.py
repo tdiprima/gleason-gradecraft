@@ -20,6 +20,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple, List
 import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import pandas as pd
 import numpy as np
@@ -27,6 +29,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+import torch
 from fastai.vision.all import *
 from fastai.callback.tracker import SaveModelCallback
 from sklearn.model_selection import train_test_split
@@ -37,6 +40,42 @@ import mlflow
 import mlflow.fastai
 
 warnings.filterwarnings('ignore')
+
+# =============================================================================
+# GPU AND CPU CONFIGURATION
+# =============================================================================
+
+def setup_hardware():
+    """Configure GPU and CPU settings for optimal performance."""
+    
+    # GPU Setup
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"🖥️  GPU: {gpu_name} ({gpu_memory:.1f} GB) x {gpu_count}")
+        
+        # Enable cuDNN optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+        
+        # Set default tensor type to CUDA
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        
+        # Enable TF32 for Ampere+ GPUs (faster matrix ops)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    else:
+        print("⚠️  No GPU detected - training will be slow!")
+    
+    # CPU Setup for data loading
+    n_cpu = mp.cpu_count()
+    print(f"💻 CPU cores available: {n_cpu}")
+    
+    return torch.cuda.is_available()
+
+# Run hardware setup at import
+HAS_GPU = setup_hardware()
 
 # =============================================================================
 # CONFIGURATION
@@ -67,12 +106,20 @@ class Config:
     VALID_SIZE = 0.15      # 15% of remaining for validation
     RANDOM_SEED = 42
     
+    # Hardware configuration
+    NUM_WORKERS = 64       # Number of CPU workers for data loading (you have 68 cores)
+    PIN_MEMORY = True      # Faster GPU transfer when True
+    PREFETCH_FACTOR = 4    # Batches to prefetch per worker
+    
     # Training defaults (Optuna will override these)
-    DEFAULT_BATCH_SIZE = 32
+    DEFAULT_BATCH_SIZE = 64  # Larger batch for GPU efficiency
     DEFAULT_LR = 1e-3
     DEFAULT_EPOCHS = 10
     DEFAULT_ARCH = "resnet34"
     IMAGE_SIZE = 224
+    
+    # Mixed precision training (faster on modern GPUs)
+    USE_FP16 = True
     
     # Optuna settings
     N_OPTUNA_TRIALS = 20
@@ -96,9 +143,18 @@ def is_valid_image(filepath: Path) -> bool:
         with Image.open(filepath) as img:
             img.load()
         return True
-    except Exception as e:
-        print(f"  ⚠ Corrupt image skipped: {filepath.name} ({e})")
+    except Exception:
         return False
+
+
+def validate_image_worker(filepath: str) -> Tuple[str, bool, Optional[int]]:
+    """Worker function for parallel image validation."""
+    path = Path(filepath)
+    label = extract_label_from_filename(path.name)
+    if label is None:
+        return filepath, False, None
+    is_valid = is_valid_image(path)
+    return filepath, is_valid, label
 
 
 def extract_label_from_filename(filename: str) -> Optional[int]:
@@ -113,6 +169,7 @@ def extract_label_from_filename(filename: str) -> Optional[int]:
 def prepare_dataset(image_dir: Path, config: Config) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Scan image directory, validate images, extract labels, and split into train/val/test.
+    Uses parallel processing for fast validation on many CPU cores.
     
     Returns:
         Tuple of (train_df, valid_df, test_df)
@@ -130,30 +187,39 @@ def prepare_dataset(image_dir: Path, config: Config) -> Tuple[pd.DataFrame, pd.D
         print("Please update Config.IMAGE_DIR to point to your image folder.")
         sys.exit(1)
     
-    # Validate images and extract labels
-    print("\nValidating images and extracting labels...")
+    # Parallel validation using all available cores
+    print(f"\nValidating images using {config.NUM_WORKERS} CPU cores...")
     valid_data = []
     corrupt_count = 0
     label_counts = {i: 0 for i in range(6)}
     
-    for i, img_path in enumerate(all_images):
-        if (i + 1) % 1000 == 0:
-            print(f"  Processed {i+1}/{len(all_images)} images...")
+    # Use ProcessPoolExecutor for parallel image validation
+    image_paths = [str(p) for p in all_images]
+    
+    with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
+        futures = {executor.submit(validate_image_worker, p): p for p in image_paths}
         
-        label = extract_label_from_filename(img_path.name)
-        if label is None:
-            continue
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            if completed % 5000 == 0:
+                print(f"  Validated {completed}/{len(all_images)} images...")
             
-        if is_valid_image(img_path):
-            label_name = config.LABEL_MAP[label] if not config.USE_NUMERIC_LABELS else str(label)
-            valid_data.append({
-                "filepath": str(img_path),
-                "label": label_name,
-                "label_num": label
-            })
-            label_counts[label] += 1
-        else:
-            corrupt_count += 1
+            filepath, is_valid, label = future.result()
+            
+            if label is None:
+                continue
+            
+            if is_valid:
+                label_name = config.LABEL_MAP[label] if not config.USE_NUMERIC_LABELS else str(label)
+                valid_data.append({
+                    "filepath": filepath,
+                    "label": label_name,
+                    "label_num": label
+                })
+                label_counts[label] += 1
+            else:
+                corrupt_count += 1
     
     print(f"\n✓ Valid images: {len(valid_data)}")
     print(f"✗ Corrupt/skipped: {corrupt_count}")
@@ -211,10 +277,10 @@ def create_dataloaders(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
     config: Config,
-    batch_size: int = 32,
+    batch_size: int = 64,
     image_size: int = 224
 ) -> DataLoaders:
-    """Create FastAI DataLoaders from DataFrames."""
+    """Create FastAI DataLoaders from DataFrames with optimized GPU/CPU settings."""
     
     # Combine for DataBlock
     combined_df = pd.concat([
@@ -243,11 +309,26 @@ def create_dataloaders(
         ]
     )
     
-    return dblock.dataloaders(combined_df, bs=batch_size)
+    # Create dataloaders with optimized settings for GPU training
+    dls = dblock.dataloaders(
+        combined_df, 
+        bs=batch_size,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        prefetch_factor=config.PREFETCH_FACTOR,
+        persistent_workers=True  # Keep workers alive between epochs
+    )
+    
+    # Move to GPU
+    if HAS_GPU:
+        dls = dls.cuda()
+    
+    return dls
 
 
 def train_model(
     dls: DataLoaders,
+    config: Config,
     arch_name: str = "resnet34",
     lr: float = 1e-3,
     epochs: int = 10,
@@ -259,6 +340,7 @@ def train_model(
 ) -> Tuple[Learner, dict]:
     """
     Train a FastAI model with the given hyperparameters.
+    Uses mixed precision (FP16) for faster GPU training.
     
     Returns:
         Tuple of (learner, metrics_dict)
@@ -286,9 +368,13 @@ def train_model(
         cbs=cbs
     )
     
+    # Enable mixed precision training for faster GPU performance
+    if config.USE_FP16 and HAS_GPU:
+        learn = learn.to_fp16()
+    
     # Optional mixup
     if mixup > 0:
-        learn = learn.to_fp16().add_cb(MixUp(mixup))
+        learn = learn.add_cb(MixUp(mixup))
     
     # Train: freeze first, then unfreeze
     learn.freeze()
@@ -403,15 +489,136 @@ def evaluate_model(
 
 
 # =============================================================================
+# TORCHSCRIPT EXPORT
+# =============================================================================
+
+def export_to_torchscript(
+    learn: Learner,
+    output_dir: Path,
+    image_size: int = 224
+) -> Optional[Path]:
+    """
+    Export FastAI model to TorchScript format for production deployment.
+    
+    TorchScript advantages:
+    - No Python dependency at inference time
+    - Can run in C++/Java/other runtimes
+    - Optimized for production serving
+    - Smaller file size (no training state)
+    
+    Returns:
+        Path to exported .pt file, or None if export failed
+    """
+    print("\n" + "-"*60)
+    print("📦 EXPORTING TO TORCHSCRIPT")
+    print("-"*60)
+    
+    try:
+        # Get the PyTorch model from FastAI learner
+        model = learn.model.eval()
+        
+        # Move to CPU for broader compatibility (can also export CUDA version)
+        model_cpu = model.cpu()
+        
+        # Create example input tensor (batch_size=1, channels=3, height, width)
+        example_input = torch.randn(1, 3, image_size, image_size)
+        
+        # Trace the model (records operations during forward pass)
+        with torch.no_grad():
+            traced_model = torch.jit.trace(model_cpu, example_input)
+        
+        # Optimize for inference
+        traced_model = torch.jit.optimize_for_inference(traced_model)
+        
+        # Save TorchScript model
+        torchscript_path = output_dir / "gleason_classifier_final.pt"
+        traced_model.save(str(torchscript_path))
+        
+        # Also save class labels for inference
+        labels_path = output_dir / "class_labels.json"
+        class_labels = {i: label for i, label in enumerate(learn.dls.vocab)}
+        with open(labels_path, 'w') as f:
+            json.dump(class_labels, f, indent=2)
+        
+        # Report file sizes
+        pkl_size = (output_dir / "gleason_classifier_final.pkl").stat().st_size / 1e6
+        pt_size = torchscript_path.stat().st_size / 1e6
+        
+        print(f"✓ TorchScript model saved to {torchscript_path}")
+        print(f"✓ Class labels saved to {labels_path}")
+        print(f"  FastAI .pkl size: {pkl_size:.1f} MB")
+        print(f"  TorchScript .pt size: {pt_size:.1f} MB")
+        
+        # Move model back to GPU if available
+        if HAS_GPU:
+            learn.model.cuda()
+        
+        return torchscript_path
+        
+    except Exception as e:
+        print(f"⚠ TorchScript export failed: {e}")
+        print("  The .pkl model is still available for inference via FastAI.")
+        return None
+
+
+def load_torchscript_model(model_path: str, labels_path: str):
+    """
+    Example function showing how to load and use the TorchScript model.
+    
+    Usage:
+        model, labels, transform = load_torchscript_model(
+            'output/gleason_classifier_final.pt',
+            'output/class_labels.json'
+        )
+        
+        # Load and preprocess image
+        from PIL import Image
+        img = Image.open('test_image.png').convert('RGB')
+        input_tensor = transform(img).unsqueeze(0)
+        
+        # Predict
+        with torch.no_grad():
+            output = model(input_tensor)
+            pred_idx = output.argmax(dim=1).item()
+            pred_label = labels[str(pred_idx)]
+            confidence = torch.softmax(output, dim=1)[0, pred_idx].item()
+        
+        print(f"Predicted: {pred_label} ({confidence:.1%})")
+    """
+    from torchvision import transforms
+    
+    # Load model
+    model = torch.jit.load(model_path)
+    model.eval()
+    
+    # Load labels
+    with open(labels_path) as f:
+        labels = json.load(f)
+    
+    # ImageNet normalization (same as training)
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+    
+    return model, labels, transform
+
+
+# =============================================================================
 # OPTUNA HYPERPARAMETER OPTIMIZATION
 # =============================================================================
 
 def optuna_objective(trial: optuna.Trial, train_df: pd.DataFrame, valid_df: pd.DataFrame, config: Config) -> float:
     """Optuna objective function for hyperparameter optimization."""
     
-    # Suggest hyperparameters
+    # Suggest hyperparameters - larger batches for GPU
     arch_name = trial.suggest_categorical('architecture', ['resnet18', 'resnet34', 'resnet50'])
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256])  # Larger batches for GPU
     lr = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
     epochs = trial.suggest_int('epochs', 5, 15)
     freeze_epochs = trial.suggest_int('freeze_epochs', 1, 3)
@@ -432,6 +639,7 @@ def optuna_objective(trial: optuna.Trial, train_df: pd.DataFrame, valid_df: pd.D
             
             learn, metrics = train_model(
                 dls=dls,
+                config=config,
                 arch_name=arch_name,
                 lr=lr,
                 epochs=epochs,
@@ -526,14 +734,18 @@ def main():
     # Start main MLflow run
     with mlflow.start_run(run_name=f"gleason_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
         
-        # Log config
+        # Log config including hardware
         mlflow.log_params({
             "test_size": config.TEST_SIZE,
             "valid_size": config.VALID_SIZE,
             "n_train": len(train_df),
             "n_valid": len(valid_df),
             "n_test": len(test_df),
-            "n_optuna_trials": config.N_OPTUNA_TRIALS
+            "n_optuna_trials": config.N_OPTUNA_TRIALS,
+            "num_workers": config.NUM_WORKERS,
+            "use_fp16": config.USE_FP16,
+            "gpu_available": HAS_GPU,
+            "gpu_name": torch.cuda.get_device_name(0) if HAS_GPU else "None",
         })
         
         # Run hyperparameter search
@@ -553,6 +765,7 @@ def main():
         
         learn, metrics = train_model(
             dls=dls,
+            config=config,
             arch_name=best_params.get('architecture', 'resnet34'),
             lr=best_params.get('learning_rate', 1e-3),
             epochs=best_params.get('epochs', 10),
@@ -568,11 +781,16 @@ def main():
         test_metrics = evaluate_model(learn, test_df, config, config.OUTPUT_DIR)
         mlflow.log_metrics(test_metrics)
         
-        # Save final model
+        # Save final model as FastAI .pkl
         model_path = config.OUTPUT_DIR / "gleason_classifier_final.pkl"
         learn.export(model_path)
-        print(f"\n✓ Model saved to {model_path}")
+        print(f"\n✓ FastAI model saved to {model_path}")
         mlflow.log_artifact(str(model_path))
+        
+        # Export to TorchScript for production deployment
+        torchscript_path = export_to_torchscript(learn, config.OUTPUT_DIR, config.IMAGE_SIZE)
+        if torchscript_path:
+            mlflow.log_artifact(str(torchscript_path))
         
         # Log confusion matrix
         mlflow.log_artifact(str(config.OUTPUT_DIR / "confusion_matrix.png"))

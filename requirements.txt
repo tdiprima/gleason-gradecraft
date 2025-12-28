@@ -9,6 +9,7 @@ torchvision>=0.15.0
 
 # Hyperparameter optimization
 optuna>=3.0.0
+optuna-integration[fastaiv2]
 
 # Experiment tracking
 mlflow>=2.0.0

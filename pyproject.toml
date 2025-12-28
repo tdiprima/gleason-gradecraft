@@ -14,7 +14,7 @@ dependencies = [
     "pillow>=12.0.0",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
-    "optuna-integration[fastaiv2]",
+    # "optuna-integration[fastaiv2]",
     "torch>=2.6.0",
     "torchvision>=0.15.0",
 ]

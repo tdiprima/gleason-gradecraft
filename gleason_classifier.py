@@ -30,10 +30,12 @@ import seaborn as sns
 import torch
 from fastai.callback.tracker import SaveModelCallback
 from fastai.vision.all import *
-from optuna.integration import FastAIPruningCallback
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
+
+# NOTE: We don't use optuna.integration.FastAIPruningCallback because it has
+# pickling issues with CUDA tensors. We implement a custom callback below.
 
 warnings.filterwarnings("ignore")
 
@@ -138,6 +140,42 @@ class Config:
     # MLflow settings
     MLFLOW_EXPERIMENT = "gleason_classifier"
     MLFLOW_TRACKING_URI = "./mlruns"
+
+
+# =============================================================================
+# CUSTOM OPTUNA PRUNING CALLBACK (avoids CUDA pickling issues)
+# =============================================================================
+
+
+class OptunaPruningCallback(Callback):
+    """
+    FastAI callback for Optuna pruning that avoids CUDA tensor pickling issues.
+    
+    The official FastAIPruningCallback from optuna-integration can fail with
+    'Cannot pickle CUDA storage' errors when used with GPU training and
+    multiple DataLoader workers. This implementation avoids that by only
+    passing Python floats to Optuna.
+    """
+    
+    def __init__(self, trial: optuna.Trial, monitor: str = "valid_loss"):
+        self.trial = trial
+        self.monitor = monitor
+    
+    def after_epoch(self):
+        # Get the monitored value and convert to Python float (not CUDA tensor)
+        value = self.recorder.values[-1][self.recorder.metric_names.index(self.monitor)]
+        
+        # Ensure it's a plain Python float, not a tensor
+        if hasattr(value, 'item'):
+            value = value.item()
+        value = float(value)
+        
+        # Report to Optuna
+        self.trial.report(value, step=self.epoch)
+        
+        # Check if trial should be pruned
+        if self.trial.should_prune():
+            raise optuna.TrialPruned(f"Trial pruned at epoch {self.epoch}")
 
 
 # =============================================================================
@@ -400,7 +438,7 @@ def train_model(
     # Build learner with metrics
     cbs = []
     if trial is not None:
-        cbs.append(FastAIPruningCallback(trial, monitor="valid_loss"))
+        cbs.append(OptunaPruningCallback(trial, monitor="valid_loss"))
 
     if save_path:
         cbs.append(SaveModelCallback(monitor="valid_loss", fname="best_model"))
@@ -717,6 +755,9 @@ def optuna_objective(
 
             return metrics["f1_macro"]
 
+    except optuna.TrialPruned:
+        # Re-raise pruning exception so Optuna handles it properly
+        raise
     except Exception as e:
         print(f"  ❌ Trial failed: {e}")
         return 0.0

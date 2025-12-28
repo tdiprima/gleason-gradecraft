@@ -37,6 +37,12 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
+# Fix CUDA multiprocessing issue - must be set before CUDA initialization
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
 # =============================================================================
 # GPU AND CPU CONFIGURATION
 # =============================================================================

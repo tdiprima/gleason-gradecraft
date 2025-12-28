@@ -62,8 +62,9 @@ def setup_hardware():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
 
-        # Set default tensor type to CUDA
-        torch.set_default_tensor_type("torch.cuda.FloatTensor")
+        # NOTE: Don't set default tensor type to CUDA - causes pickling issues with DataLoader workers
+        # Instead, explicitly move models/data to GPU as needed (e.g., dls.cuda(), learn.to_fp16())
+        # torch.set_default_tensor_type("torch.cuda.FloatTensor")  # DISABLED - breaks multiprocessing
 
         # Enable TF32 for Ampere+ GPUs (faster matrix ops)
         torch.backends.cuda.matmul.allow_tf32 = True

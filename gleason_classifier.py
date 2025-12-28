@@ -40,26 +40,17 @@ from sklearn.model_selection import train_test_split
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# MULTIPROCESSING SETUP (must be before any CUDA operations)
-# =============================================================================
-
-# Set multiprocessing start method to 'spawn' for CUDA compatibility
-# This must happen before any CUDA tensors are created
-if __name__ == "__main__" or mp.current_process().name == "MainProcess":
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass  # Already set
-
-
-# =============================================================================
 # GPU AND CPU CONFIGURATION
 # =============================================================================
 
+# Global flag - will be set properly in main()
+HAS_GPU = False
+
 
 def setup_hardware():
-    """Configure GPU and CPU settings for optimal performance."""
-
+    """Configure GPU and CPU settings for optimal performance. Only call from main process."""
+    global HAS_GPU
+    
     # GPU Setup
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
@@ -71,25 +62,20 @@ def setup_hardware():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
 
-        # NOTE: Don't set default tensor type to CUDA - causes pickling issues with DataLoader workers
-        # Instead, explicitly move models/data to GPU as needed (e.g., dls.cuda(), learn.to_fp16())
-        # torch.set_default_tensor_type("torch.cuda.FloatTensor")  # DISABLED - breaks multiprocessing
-
         # Enable TF32 for Ampere+ GPUs (faster matrix ops)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        
+        HAS_GPU = True
     else:
         print("⚠️  No GPU detected - training will be slow!")
+        HAS_GPU = False
 
     # CPU Setup for data loading
     n_cpu = mp.cpu_count()
     print(f"💻 CPU cores available: {n_cpu}")
 
-    return torch.cuda.is_available()
-
-
-# Run hardware setup at import
-HAS_GPU = setup_hardware()
+    return HAS_GPU
 
 # =============================================================================
 # CONFIGURATION
@@ -126,9 +112,10 @@ class Config:
     RANDOM_SEED = 42
 
     # Hardware configuration
-    # NOTE: With CUDA + multiprocessing, fewer workers is often more stable
-    NUM_WORKERS = 8  # Reduced from 64 to avoid CUDA pickling issues
-    PIN_MEMORY = True  # Faster GPU transfer when True
+    # NOTE: NUM_WORKERS=0 avoids all CUDA multiprocessing pickling issues
+    # Data loading happens in main process. GPU training is still fast.
+    NUM_WORKERS = 0
+    PIN_MEMORY = False  # Only useful when NUM_WORKERS > 0
 
     # Training defaults (Optuna will override these)
     DEFAULT_BATCH_SIZE = 64  # Larger batch for GPU efficiency
@@ -376,7 +363,7 @@ def create_dataloaders(
     batch_size: int = 64,
     image_size: int = 224,
 ) -> DataLoaders:
-    """Create FastAI DataLoaders from DataFrames with optimized GPU/CPU settings."""
+    """Create FastAI DataLoaders from DataFrames."""
 
     # Combine for DataBlock
     combined_df = pd.concat(
@@ -404,16 +391,9 @@ def create_dataloaders(
         ],
     )
 
-    # Create dataloaders
-    # NOTE: persistent_workers=False to avoid CUDA pickling issues
-    # NOTE: pin_memory=True still helps with CPU->GPU transfer
-    dls = dblock.dataloaders(
-        combined_df,
-        bs=batch_size,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY,
-        persistent_workers=False,  # MUST be False to avoid CUDA pickling errors
-    )
+    # Create dataloaders - simple settings to avoid CUDA issues
+    # num_workers=0 means all data loading happens in main process
+    dls = dblock.dataloaders(combined_df, bs=batch_size, num_workers=0)
 
     return dls
 
@@ -813,6 +793,10 @@ def run_hyperparameter_search(
 
 def main():
     """Main training pipeline."""
+    global HAS_GPU
+    
+    # Setup hardware FIRST, before any other operations
+    HAS_GPU = setup_hardware()
 
     print("\n" + "=" * 60)
     print("🔬 GLEASON SCORE CLASSIFIER")

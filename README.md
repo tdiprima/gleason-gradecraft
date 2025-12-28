@@ -22,16 +22,18 @@ uv sync
 
 ### 2. Organize Your Images
 
-Place all your PNG images in a single folder. The script extracts labels from filename suffixes:
+Place all your PNG images in a single folder. The script extracts labels from filename suffixes (`*-{label}.png` or `*_{label}.png`):
 
-| Suffix | Label |
-|--------|-------|
-| `*_0.png` | benign |
-| `*_1.png` | gleason_3_3 |
-| `*_2.png` | gleason_3_4 |
-| `*_3.png` | gleason_4_3 |
-| `*_4.png` | gleason_4_4 |
-| `*_5.png` | gleason_4_5_5_4_5_5 |
+| Label | Class | Status |
+|-------|-------|--------|
+| `*_0.png` | Benign | ✓ Used |
+| `*_1.png` | Gleason 3 | ✓ Used |
+| `*_2.png` | Gleason 4 | ✓ Used |
+| `*_3.png` | Gleason 5 - Single Cells | ✓ Used |
+| `*_4.png` | Gleason 5 - Secretions | ⊘ Skipped |
+| `*_5.png` | Gleason 5 | ⊘ Skipped |
+
+**Note:** Labels 4 and 5 are automatically skipped during training (configured in `Config.SKIP_LABELS`).
 
 ### 3. Configure the Script
 

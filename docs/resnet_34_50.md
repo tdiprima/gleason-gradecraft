@@ -1,4 +1,4 @@
-## Why ResNet34?
+## Why ResNet34 (isn't ResNet50 better)?
 
 You raise a good point, but it's not quite that simple:
 

@@ -4,11 +4,11 @@
 
 This repo is a **machine learning pipeline** that looks at histopathology images and predicts **Gleason scores**.
 
-No magic. No buzzwords. Just computers being trained to notice patterns.
+Just computers being trained to notice patterns.
 
 ---
 
-## ✨ What this actually does (in plain English)
+## ✨ What this actually does
 
 * You give it microscope image patches
 * It learns what *benign vs aggressive cancer* looks like
@@ -24,7 +24,7 @@ We use some battle-tested tools:
 * **Optuna** → automatically tries different settings so *you don't have to guess*
 * **ResNet** → a proven image-recognition backbone that actually works
 
-You don't need to be an ML wizard. This pipeline handles the boring stuff.
+This pipeline handles the boring stuff.
 
 ---
 
@@ -43,7 +43,7 @@ You don't need to be an ML wizard. This pipeline handles the boring stuff.
 
 ---
 
-## 💻 Requirements (aka “will this run on my machine?”)
+## 💻 Requirements (aka "will this run on my machine?")
 
 * Python **3.9+**
 * NVIDIA GPU with CUDA
@@ -142,8 +142,8 @@ Translation: **you get proof, not vibes**.
 
 ### Key ideas you should know
 
-**1️⃣ Class Weights**
-Some Gleason classes are rare.
+**1️⃣ Class Weights**  
+Some Gleason classes are rare.  
 We tell the model:
 
 "Hey, don't ignore the rare stuff."
@@ -154,13 +154,13 @@ We tell the model:
 * **15% validation** → checks itself while learning
 * **15% test** → final exam (never seen before)
 
-**3️⃣ Hyperparameters**
-Training settings like learning rate.
+**3️⃣ Hyperparameters**  
+Training settings like learning rate.  
 Optuna tries different combos so you don't have to guess.
 
-**4️⃣ Transfer Learning**
-We start with a model that already knows how images work,
-then teach it pathology.
+**4️⃣ Transfer Learning**  
+We start with a model that already knows how images work,  
+then teach it pathology.  
 Faster. Better. Less data needed.
 
 ---
@@ -196,7 +196,7 @@ No, that doesn't mean it's always right.
 
 ---
 
-## 🧯 Troubleshooting (aka “when things break”)
+## 🧯 Troubleshooting (aka "when things break")
 
 ### ❌ CUDA out of memory
 

@@ -1,128 +1,233 @@
-# Gleason Score Image Classifier
+# 🧠🧪 Gleason Score Image Classifier
 
-A machine learning pipeline for classifying prostate cancer histopathology images by Gleason score.
+**Teaching a computer to read prostate cancer slides (so we don't have to squint forever)**
 
-## Overview
+This repo is a **machine learning pipeline** that looks at histopathology images and predicts **Gleason scores**.
 
-This pipeline uses:
+No magic. No buzzwords. Just computers being trained to notice patterns.
 
-- **FastAI** - Makes deep learning accessible and fast
-- **Optuna** - Automatically finds the best hyperparameters
-- **ResNet** - Proven image classification architecture
+---
 
-## Gleason Score Labels
+## ✨ What this actually does (in plain English)
 
-| Label | Description |
-|-------|-------------|
-| 0 | Benign |
-| 1 | Gleason 3 |
-| 2 | Gleason 4 |
-| 3 | Gleason 5-Single Cells |
-| 4 | Gleason 5-Secretions (SKIPPED) |
-| 5 | Gleason 5 (SKIPPED) |
+* You give it microscope image patches
+* It learns what *benign vs aggressive cancer* looks like
+* It spits out predictions + receipts (metrics, logs, confusion matrices)
 
-## Requirements
+---
 
-- Python 3.9+
-- NVIDIA GPU with CUDA support
-- At least 8GB GPU memory recommended
+## 🧰 What's under the hood
 
-## Installation
+We use some battle-tested tools:
+
+* **FastAI** → makes deep learning way less painful
+* **Optuna** → automatically tries different settings so *you don't have to guess*
+* **ResNet** → a proven image-recognition backbone that actually works
+
+You don't need to be an ML wizard. This pipeline handles the boring stuff.
+
+---
+
+## 🏷️ Gleason Labels (aka "what the numbers mean")
+
+| Label | Meaning                              |
+| ----: | ------------------------------------ |
+|     0 | Benign                               |
+|     1 | Gleason 3                            |
+|     2 | Gleason 4                            |
+|     3 | Gleason 5 – Single Cells             |
+|     4 | Gleason 5 – Secretions (**SKIPPED**) |
+|     5 | Gleason 5 (**SKIPPED**)              |
+
+⚠️ Labels 4 and 5 exist in theory but are **not used** in training.
+
+---
+
+## 💻 Requirements (aka “will this run on my machine?”)
+
+* Python **3.9+**
+* NVIDIA GPU with CUDA
+* **8GB+ GPU memory** recommended  
+  (More is better. Your GPU will thank you.)
+
+---
+
+## ⚙️ Installation (2 minutes, promise)
 
 ```bash
-# Create a virtual environment (recommended)
+# Create a virtual environment (strongly recommended)
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Install everything
+uv sync
 ```
 
-## Data Setup
+If this fails, it's usually CUDA or driver-related. See troubleshooting below.
 
-1. Place images in the `./gleason_images` folder
-2. Images should be named with the pattern: `*-{label}.png`
-   - Example: `patient001_patch042-2.png` (label = 2, Gleason 4)
+---
 
-## Usage
+## 🖼️ Data Setup (important!)
+
+1. Put your images in:
+
+   ```
+   ./gleason_images/
+   ```
+
+2. File naming **must** look like this:
+
+   ```
+   anything_you_want_{label}.png
+   ```
+
+   Example:
+
+   ```
+   patient001_patch042_2.png
+   ```
+
+   → label = `2` → Gleason 4
+
+If filenames are wrong, the model will be confused. And confused models do bad things.
+
+---
+
+## 🚀 Run It
 
 ```bash
-# Run the training pipeline
-python gleason_classifier.py
+uv run gleason_classifier.py
 ```
 
-## Configuration
+That's it.  
+Go get coffee. This part takes time.
 
-Edit the `Config` class in `gleason_classifier.py` to change:
+---
+
+## 🛠️ Configuration (the knobs you're allowed to turn)
+
+Open `gleason_classifier.py` and find:
 
 ```python
 class Config:
-    DATA_PATH = Path("./gleason_images") # Image folder
-    OUTPUT_PATH = Path("./output")    # Where results are saved
-    NUM_TRIALS = 20                   # Optuna optimization trials
-    BATCH_SIZE = 32                   # Reduce if GPU runs out of memory
+    DATA_PATH = Path("./gleason_images")
+    OUTPUT_PATH = Path("./output")
+    NUM_TRIALS = 20
+    BATCH_SIZE = 32
 ```
 
-## Output Files
+What these do:
 
-After training, you'll find in `./output/`:
+* **DATA_PATH** → where your images live
+* **OUTPUT_PATH** → where results go
+* **NUM_TRIALS** → how hard Optuna tries to find good settings
+* **BATCH_SIZE** → lower this if your GPU screams
 
-- `best_model.pkl` - The trained model
-- `training_log_*.txt` - Detailed training logs
-- `confusion_matrix.csv` - Model predictions vs actual
-- `per_class_metrics.csv` - Precision, recall, F1 per class
+---
 
-## Understanding the Code
+## 📦 What you get after training
 
-### Key Concepts
+Everything lands in `./output/`:
 
-1. **Class Weights**: Since the data is imbalanced (some classes have more images), we give higher weights to rare classes so the model learns them better.
+* 🧠 `best_model.pkl` → the trained model
+* 📝 `training_log_*.txt` → full training history
+* 📊 `confusion_matrix.csv` → what it got right vs wrong
+* 📈 `per_class_metrics.csv` → precision, recall, F1 per class
 
-2. **Data Split**: 
-   - Training (70%): Model learns from these
-   - Validation (15%): Checks performance during training
-   - Test (15%): Final evaluation on unseen data
+Translation: **you get proof, not vibes**.
 
-3. **Hyperparameters**: Settings like learning rate that affect training. Optuna finds the best ones automatically.
+---
 
-4. **Transfer Learning**: We start with a model pre-trained on ImageNet, then fine-tune it for our task. This is faster and works better with limited data.
+## 🧩 How the code thinks (no math)
 
-### Pipeline Steps
+### Key ideas you should know
 
-1. **Setup** - Initialize logging, check GPU
-2. **Load Data** - Read images, extract labels, split data
-3. **Calculate Weights** - Handle class imbalance
-4. **Hyperparameter Search** - Try different settings
-5. **Train Final Model** - Use best settings
-6. **Evaluate** - Test on held-out data
-7. **Save** - Export model and metrics
+**1️⃣ Class Weights**
+Some Gleason classes are rare.
+We tell the model:
 
-## Loading a Trained Model
+"Hey, don't ignore the rare stuff."
+
+**2️⃣ Data Split**
+
+* **70% training** → learns patterns
+* **15% validation** → checks itself while learning
+* **15% test** → final exam (never seen before)
+
+**3️⃣ Hyperparameters**
+Training settings like learning rate.
+Optuna tries different combos so you don't have to guess.
+
+**4️⃣ Transfer Learning**
+We start with a model that already knows how images work,
+then teach it pathology.
+Faster. Better. Less data needed.
+
+---
+
+## 🔁 Pipeline flow (big picture)
+
+1. Setup logging + GPU checks
+2. Load images & labels
+3. Handle class imbalance
+4. Hyperparameter search (Optuna)
+5. Train final model
+6. Evaluate on unseen data
+7. Save everything
+
+No step is skipped. No vibes-only training.
+
+---
+
+## 🔮 Load a trained model later
 
 ```python
 from fastai.vision.all import load_learner
 
-# Load the saved model
 learn = load_learner("./output/best_model.pkl")
 
-# Make predictions
-predictions = learn.predict("path/to/image.png")
-print(f"Predicted class: {predictions[0]}")
-print(f"Confidence: {predictions[2].max():.2%}")
+pred = learn.predict("path/to/image.png")
+print(f"Predicted class: {pred[0]}")
+print(f"Confidence: {pred[2].max():.2%}")
 ```
 
-## Troubleshooting
+Yes, it always gives an answer.  
+No, that doesn't mean it's always right.
 
-### "CUDA out of memory"
-- Reduce `BATCH_SIZE` in Config (try 16 or 8)
-- Use ResNet34 instead of ResNet50
+---
 
-### "No GPU found"
-- Install CUDA toolkit
-- Check `torch.cuda.is_available()` returns True
+## 🧯 Troubleshooting (aka “when things break”)
 
-### Corrupt images cause errors
-- The pipeline automatically skips corrupt images
-- Check logs for which files were skipped
+### ❌ CUDA out of memory
+
+* Lower `BATCH_SIZE` (try 16 or 8)
+* Switch to **ResNet34** instead of ResNet50
+
+### ❌ No GPU found
+
+* Install CUDA toolkit
+* Verify:
+
+  ```python
+  torch.cuda.is_available()
+  ```
+
+### ❌ Crashes on bad images
+
+* Corrupt images are **automatically skipped**
+* Check logs to see which ones were ignored
+
+---
+
+## 🧠 Final vibe check
+
+This repo is:
+
+* practical
+* reproducible
+* not pretending ML is magic
+
+If you're here to **actually understand what your model is doing**,  
+you're in the right place.
 
 <br>

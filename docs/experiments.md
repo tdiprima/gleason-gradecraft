@@ -1,6 +1,14 @@
-Solid initial results! Here's a breakdown:
+## Experiment 1a:
 
-## Current Performance
+```
+📊 Final Test Metrics:
+   Accuracy:  0.7695
+   F1 (macro): 0.5974
+   Precision: 0.5882
+   Recall:    0.6117
+```
+
+## Experiment 1
 
 | Metric | Value | Assessment |
 |--------|-------|------------|
@@ -15,16 +23,16 @@ Duration: 1.3h
 
 gleason_classifier.py commit 266b917
 
-best\_learning_rate  
+best\_learning_rate:  
 0.00011989375667768034
 
-best\_mixup  
+best\_mixup:  
 0.00043255619424744653
 
-best\_weight_decay  
+best\_weight_decay:  
 0.018226241522626342
 
-best\_architecture  
+best\_architecture:  
 resnet50
 
 <br>

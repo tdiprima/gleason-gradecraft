@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+uv.lock
+
 mlruns/
 output/
 gleason_images

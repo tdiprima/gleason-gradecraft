@@ -1,14 +1,14 @@
-## Experiment 1a:
+## Experiment "1a"
 
-```
+```c
 📊 Final Test Metrics:
-   Accuracy:  0.7695
+   Accuracy:   0.7695
    F1 (macro): 0.5974
-   Precision: 0.5882
-   Recall:    0.6117
+   Precision:  0.5882
+   Recall:     0.6117
 ```
 
-## Experiment 1
+## Experiment "1"
 
 | Metric | Value | Assessment |
 |--------|-------|------------|
@@ -34,5 +34,27 @@ best\_weight_decay:
 
 best\_architecture:  
 resnet50
+
+## Experiment "2"
+
+gleason_classifier.py commit 5c160ce (started over)
+
+Found the GPU, accidentally didn't use it. :p  
+Execution time: 
+
+HYPERPARAMETER OPTIMIZATION COMPLETE
+
+```c
+Best trial accuracy: [wrong value]
+
+Best hyperparameters:
+  learning_rate: 0.007750014647242031
+  batch_size: 16
+  epochs: 15
+```
+
+TRAINING FINAL MODEL WITH BEST HYPERPARAMETERS
+
+
 
 <br>

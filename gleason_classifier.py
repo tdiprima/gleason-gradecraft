@@ -425,19 +425,10 @@ def train_model(
         ]
     )
     
-    # Get best validation accuracy from the recorder
-    # The recorder stores metrics as a list of values per epoch
-    try:
-        # Get the accuracy values (second metric, index 1)
-        accuracies = [v[1] for v in learn.recorder.values]
-        # Handle both tensor and float values
-        best_accuracy = max(
-            acc.item() if hasattr(acc, 'item') else float(acc) 
-            for acc in accuracies
-        )
-    except (IndexError, TypeError):
-        # Fallback: get final validation accuracy
-        best_accuracy = float(learn.recorder.values[-1][1])
+    # Get validation accuracy by running validation
+    # This is the most reliable way to get the actual accuracy
+    val_loss, val_acc, val_err = learn.validate()
+    best_accuracy = float(val_acc)
     
     return learn, best_accuracy
 

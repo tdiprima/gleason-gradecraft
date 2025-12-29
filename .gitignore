@@ -11,4 +11,6 @@ wheels/
 
 mlruns/
 output/
+gleason_images
+models/
 .claude

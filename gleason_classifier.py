@@ -1,913 +1,686 @@
-#!/usr/bin/env python3
 """
-Gleason Score Image Classifier
-==============================
-Uses FastAI for training, Optuna for hyperparameter tuning, and MLflow for tracking.
+Gleason Score Image Classification Pipeline
+============================================
+This script trains a deep learning model to classify prostate cancer images
+by their Gleason score using FastAI and Optuna for hyperparameter tuning.
 
-Features:
-- Skips corrupt images automatically
-- Extracts labels from filename suffix (_0.png through _5.png)
-- Splits data into train/validation/test sets
-- Hyperparameter optimization with Optuna
-- Experiment tracking with MLflow
-- Outputs confusion matrix, per-class metrics, and saves best model
+Gleason Scores (labels):
+    0: Benign
+    1: Gleason 3
+    2: Gleason 4
+    3: Gleason 5-Single Cells
+    4: Gleason 5-Secretions (SKIPPED)
+    5: Gleason 5 (SKIPPED)
+
+Author: Generated for educational purposes
 """
 
-import json
-import multiprocessing as mp
-import sys
+import os
+import re
+import time
+import logging
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from datetime import datetime
+from collections import Counter
 
-import matplotlib.pyplot as plt
-import mlflow
-import optuna
-import pandas as pd
-import seaborn as sns
 import torch
-from fastai.callback.tracker import SaveModelCallback
-from fastai.vision.all import *
+import numpy as np
+import pandas as pd
+import optuna
 from PIL import Image
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
 
-# NOTE: We don't use optuna.integration.FastAIPruningCallback because it has
-# pickling issues with CUDA tensors. We implement a custom callback below.
+from fastai.vision.all import (
+    ImageDataLoaders,
+    Learner,
+    accuracy,
+    error_rate,
+    vision_learner,
+    resnet34,
+    resnet50,
+    CrossEntropyLossFlat,
+    ClassificationInterpretation,
+    SaveModelCallback,
+    EarlyStoppingCallback,
+)
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    f1_score,
+)
 
+# Suppress unnecessary warnings for cleaner output
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# GPU AND CPU CONFIGURATION
-# =============================================================================
-
-# Global flag - will be set properly in main()
-HAS_GPU = False
-
-
-def setup_hardware():
-    """Configure GPU and CPU settings for optimal performance. Only call from main process."""
-    global HAS_GPU
-    
-    # GPU Setup
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"🖥️  GPU: {gpu_name} ({gpu_memory:.1f} GB) x {gpu_count}")
-
-        # Enable cuDNN optimizations
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.enabled = True
-
-        # Enable TF32 for Ampere+ GPUs (faster matrix ops)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        HAS_GPU = True
-    else:
-        print("⚠️  No GPU detected - training will be slow!")
-        HAS_GPU = False
-
-    # CPU Setup for data loading
-    n_cpu = mp.cpu_count()
-    print(f"💻 CPU cores available: {n_cpu}")
-
-    return HAS_GPU
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION - Edit these settings for your setup
 # =============================================================================
-
 
 class Config:
-    """Central configuration for the training pipeline."""
-
-    # Data paths - UPDATE THIS TO YOUR IMAGE FOLDER
-    IMAGE_DIR = Path("./gleason_images")  # Change to your actual path
-    OUTPUT_DIR = Path("./output")
-
-    # Label mapping from filename suffix
-    # Labels 4 and 5 are skipped during training
-    LABEL_MAP = {
+    """All settings in one place for easy modification."""
+    
+    # Path to your image folder (change this to your data location)
+    DATA_PATH = Path("./gleason_images")
+    
+    # Where to save results
+    OUTPUT_PATH = Path("./output")
+    
+    # Labels we want to use (skipping 4 and 5)
+    VALID_LABELS = [0, 1, 2, 3]
+    
+    # Human-readable names for each label
+    LABEL_NAMES = {
         0: "Benign",
-        1: "Gleason_3",
-        2: "Gleason_4",
-        3: "Gleason_5_Single_Cells",
-        # 4: "Gleason_5_Secretions",  # SKIPPED
-        # 5: "Gleason_5",              # SKIPPED
+        1: "Gleason 3",
+        2: "Gleason 4",
+        3: "Gleason 5-Single Cells",
     }
-
-    # Labels to skip during training
-    SKIP_LABELS = {4, 5}
-
-    # You can also use numeric labels if preferred
-    USE_NUMERIC_LABELS = False
-
-    # Data splits
-    TEST_SIZE = 0.15  # 15% for final test
-    VALID_SIZE = 0.15  # 15% of remaining for validation
-    RANDOM_SEED = 42
-
-    # Hardware configuration
-    # NOTE: NUM_WORKERS=0 avoids all CUDA multiprocessing pickling issues
-    # Data loading happens in main process. GPU training is still fast.
-    NUM_WORKERS = 0
-    PIN_MEMORY = False  # Only useful when NUM_WORKERS > 0
-
-    # Training defaults (Optuna will override these)
-    DEFAULT_BATCH_SIZE = 64  # Larger batch for GPU efficiency
-    DEFAULT_LR = 1e-3
-    DEFAULT_EPOCHS = 10
-    DEFAULT_ARCH = "resnet34"
-    IMAGE_SIZE = 224
-
-    # Mixed precision training (faster on modern GPUs)
-    USE_FP16 = True
-
+    
+    # Class counts from your data (used for calculating weights)
+    CLASS_COUNTS = {
+        0: 19695,
+        1: 26816,
+        2: 8461,
+        3: 815,
+    }
+    
+    # Data split ratios
+    TRAIN_RATIO = 0.70  # 70% for training
+    VALID_RATIO = 0.15  # 15% for validation
+    TEST_RATIO = 0.15   # 15% for testing
+    
+    # Training settings
+    IMAGE_SIZE = 224           # Standard size for pretrained models
+    BATCH_SIZE = 32            # Adjust based on your GPU memory
+    NUM_WORKERS = 4            # Parallel data loading workers
+    
     # Optuna settings
-    N_OPTUNA_TRIALS = 20
-    OPTUNA_TIMEOUT = 3600 * 2  # 2 hours max
-
-    # MLflow settings
-    MLFLOW_EXPERIMENT = "gleason_classifier"
-    MLFLOW_TRACKING_URI = "./mlruns"
+    NUM_TRIALS = 20            # Number of hyperparameter combinations to try
+    
+    # Random seed for reproducibility
+    SEED = 42
 
 
 # =============================================================================
-# CUSTOM OPTUNA PRUNING CALLBACK (avoids CUDA pickling issues)
+# SETUP LOGGING
 # =============================================================================
 
-
-class OptunaPruningCallback(Callback):
+def setup_logging(output_path: Path) -> logging.Logger:
     """
-    FastAI callback for Optuna pruning that avoids CUDA tensor pickling issues.
+    Set up logging to both file and console.
     
-    The official FastAIPruningCallback from optuna-integration can fail with
-    'Cannot pickle CUDA storage' errors when used with GPU training and
-    multiple DataLoader workers. This implementation avoids that by only
-    passing Python floats to Optuna.
+    This helps you track what's happening during training
+    and review results later.
     """
+    # Create output directory if it doesn't exist
+    output_path.mkdir(parents=True, exist_ok=True)
     
-    def __init__(self, trial: optuna.Trial, monitor: str = "valid_loss"):
-        self.trial = trial
-        self.monitor = monitor
+    # Create log file with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = output_path / f"training_log_{timestamp}.txt"
     
-    def after_epoch(self):
-        # Get the monitored value and convert to Python float (not CUDA tensor)
-        value = self.recorder.values[-1][self.recorder.metric_names.index(self.monitor)]
-        
-        # Ensure it's a plain Python float, not a tensor
-        if hasattr(value, 'item'):
-            value = value.item()
-        value = float(value)
-        
-        # Report to Optuna
-        self.trial.report(value, step=self.epoch)
-        
-        # Check if trial should be pruned
-        if self.trial.should_prune():
-            raise optuna.TrialPruned(f"Trial pruned at epoch {self.epoch}")
+    # Configure logging format
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
+    
+    # Set up handlers for file and console
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(log_file),      # Save to file
+            logging.StreamHandler()              # Print to console
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging to: {log_file}")
+    
+    return logger
 
 
 # =============================================================================
-# DATA PREPARATION
+# GPU SETUP
 # =============================================================================
 
+def setup_gpu(logger: logging.Logger) -> torch.device:
+    """
+    Check for GPU availability and set up the device.
+    
+    GPUs make training much faster - this function ensures
+    we're using one if available.
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"✓ GPU Found: {gpu_name}")
+        logger.info(f"  GPU Memory: {gpu_memory:.1f} GB")
+    else:
+        logger.error("✗ No GPU found! Training will be very slow.")
+        logger.error("  Please ensure CUDA is installed and a GPU is available.")
+        device = torch.device("cpu")
+    
+    return device
 
-def is_valid_image(filepath: Path) -> bool:
-    """Check if an image file is valid and not corrupt."""
+
+# =============================================================================
+# DATA LOADING AND PREPARATION
+# =============================================================================
+
+def extract_label_from_filename(filename: str) -> int:
+    """
+    Extract the label from an image filename.
+    
+    Expected format: anything-{label}.png
+    Example: "image_001-2.png" -> label 2
+    """
+    # Find the pattern "-{digit}.png" at the end of filename
+    match = re.search(r"-(\d)\.png$", filename, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return -1  # Invalid label
+
+
+def is_valid_image(filepath: Path, logger: logging.Logger) -> bool:
+    """
+    Check if an image file is valid and not corrupted.
+    
+    This prevents training from crashing on bad files.
+    """
     try:
         with Image.open(filepath) as img:
-            img.verify()
-        # Re-open after verify (verify() makes file unusable)
-        with Image.open(filepath) as img:
-            img.load()
+            img.verify()  # Verify the image is not corrupted
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Skipping corrupt image: {filepath.name} - {e}")
         return False
 
 
-def validate_image_worker(filepath: str) -> Tuple[str, bool, Optional[int]]:
-    """Worker function for parallel image validation."""
-    path = Path(filepath)
-    label = extract_label_from_filename(path.name)
-    if label is None:
-        return filepath, False, None
-    is_valid = is_valid_image(path)
-    return filepath, is_valid, label
-
-
-def extract_label_from_filename(filename: str) -> Optional[int]:
-    """Extract the Gleason label from filename suffix like 'image_0.png'."""
-    stem = Path(filename).stem
-    for suffix in range(6):  # _0 through _5
-        if stem.endswith(f"_{suffix}"):
-            return suffix
-    return None
-
-
-def prepare_dataset(
-    image_dir: Path, config: Config
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_and_split_data(
+    data_path: Path,
+    logger: logging.Logger
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Scan image directory, validate images, extract labels, and split into train/val/test.
-    Uses parallel processing for fast validation on many CPU cores.
-
-    Returns:
-        Tuple of (train_df, valid_df, test_df)
+    Load image paths, extract labels, and split into train/valid/test sets.
+    
+    Returns three DataFrames containing file paths and labels.
     """
-    print("\n" + "=" * 60)
-    print("📁 PREPARING DATASET")
-    print("=" * 60)
-
+    logger.info(f"Loading data from: {data_path}")
+    
     # Find all PNG files
-    all_images = list(image_dir.glob("*.png"))
-    print(f"\nFound {len(all_images)} PNG files in {image_dir}")
-
-    if len(all_images) == 0:
-        print(f"\n❌ No PNG files found in {image_dir}")
-        print("Please update Config.IMAGE_DIR to point to your image folder.")
-        sys.exit(1)
-
-    # Parallel validation using all available cores
-    print(f"\nValidating images using {config.NUM_WORKERS} CPU cores...")
-    print(f"Skipping labels: {config.SKIP_LABELS}")
+    all_files = list(data_path.glob("**/*.png"))
+    logger.info(f"Found {len(all_files)} total PNG files")
+    
+    # Filter and validate images
     valid_data = []
+    skipped_labels = Counter()
     corrupt_count = 0
-    skipped_label_count = 0
-    label_counts = {i: 0 for i in range(6)}
-
-    # Use ProcessPoolExecutor for parallel image validation
-    image_paths = [str(p) for p in all_images]
-
-    with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
-        futures = {executor.submit(validate_image_worker, p): p for p in image_paths}
-
-        completed = 0
-        for future in as_completed(futures):
-            completed += 1
-            if completed % 5000 == 0:
-                print(f"  Validated {completed}/{len(all_images)} images...")
-
-            filepath, is_valid, label = future.result()
-
-            if label is None:
-                continue
-
-            # Track all labels for reporting
-            label_counts[label] += 1
-
-            # Skip labels 4 and 5
-            if label in config.SKIP_LABELS:
-                skipped_label_count += 1
-                continue
-
-            if is_valid:
-                label_name = (
-                    config.LABEL_MAP[label]
-                    if not config.USE_NUMERIC_LABELS
-                    else str(label)
-                )
-                valid_data.append(
-                    {"filepath": filepath, "label": label_name, "label_num": label}
-                )
-            else:
-                corrupt_count += 1
-
-    print(f"\n✓ Valid images for training: {len(valid_data)}")
-    print(f"✗ Corrupt images: {corrupt_count}")
-    print(f"⊘ Skipped (labels 4,5): {skipped_label_count}")
-
-    print("\n📊 Full dataset class distribution:")
-    all_label_names = {
-        0: "Benign",
-        1: "Gleason_3",
-        2: "Gleason_4",
-        3: "Gleason_5_Single_Cells",
-        4: "Gleason_5_Secretions",
-        5: "Gleason_5",
-    }
-    total_images = sum(label_counts.values())
-    for label_num, count in label_counts.items():
-        label_name = all_label_names[label_num]
-        pct = 100 * count / total_images if total_images else 0
-        skip_marker = " [SKIPPED]" if label_num in config.SKIP_LABELS else ""
-        print(
-            f"   {label_num} ({label_name:24s}): {count:6d} ({pct:5.1f}%){skip_marker}"
-        )
-
-    print("\n📊 Training class distribution (after filtering):")
-    training_counts = {
-        k: v for k, v in label_counts.items() if k not in config.SKIP_LABELS
-    }
-    for label_num, count in training_counts.items():
-        label_name = config.LABEL_MAP[label_num]
-        pct = 100 * count / len(valid_data) if valid_data else 0
-        print(f"   {label_num} ({label_name:24s}): {count:6d} ({pct:5.1f}%)")
-
-    # Create DataFrame
+    
+    for filepath in all_files:
+        # Extract label from filename
+        label = extract_label_from_filename(filepath.name)
+        
+        # Skip invalid labels (4 and 5)
+        if label not in Config.VALID_LABELS:
+            skipped_labels[label] += 1
+            continue
+        
+        # Skip corrupt images
+        if not is_valid_image(filepath, logger):
+            corrupt_count += 1
+            continue
+        
+        valid_data.append({
+            "filepath": str(filepath),
+            "label": label,
+            "label_name": Config.LABEL_NAMES[label]
+        })
+    
+    # Log summary
+    logger.info(f"Valid images: {len(valid_data)}")
+    logger.info(f"Corrupt images skipped: {corrupt_count}")
+    for label, count in sorted(skipped_labels.items()):
+        logger.info(f"Skipped label {label}: {count} images")
+    
+    # Create DataFrame and shuffle
     df = pd.DataFrame(valid_data)
-
-    # Stratified split: first separate test set
-    train_val_df, test_df = train_test_split(
-        df,
-        test_size=config.TEST_SIZE,
-        stratify=df["label"],
-        random_state=config.RANDOM_SEED,
-    )
-
-    # Then split train_val into train and validation
-    train_df, valid_df = train_test_split(
-        train_val_df,
-        test_size=config.VALID_SIZE / (1 - config.TEST_SIZE),
-        stratify=train_val_df["label"],
-        random_state=config.RANDOM_SEED,
-    )
-
-    print("\n📂 Data splits:")
-    print(f"   Train:      {len(train_df):6d} ({100*len(train_df)/len(df):.1f}%)")
-    print(f"   Validation: {len(valid_df):6d} ({100*len(valid_df)/len(df):.1f}%)")
-    print(f"   Test:       {len(test_df):6d} ({100*len(test_df)/len(df):.1f}%)")
-
+    df = df.sample(frac=1, random_state=Config.SEED).reset_index(drop=True)
+    
+    # Calculate split indices
+    n = len(df)
+    train_end = int(n * Config.TRAIN_RATIO)
+    valid_end = int(n * (Config.TRAIN_RATIO + Config.VALID_RATIO))
+    
+    # Split the data
+    train_df = df[:train_end].reset_index(drop=True)
+    valid_df = df[train_end:valid_end].reset_index(drop=True)
+    test_df = df[valid_end:].reset_index(drop=True)
+    
+    # Log split sizes
+    logger.info(f"Train set: {len(train_df)} images ({Config.TRAIN_RATIO*100:.0f}%)")
+    logger.info(f"Valid set: {len(valid_df)} images ({Config.VALID_RATIO*100:.0f}%)")
+    logger.info(f"Test set: {len(test_df)} images ({Config.TEST_RATIO*100:.0f}%)")
+    
+    # Log class distribution in training set
+    logger.info("Training set class distribution:")
+    for label in Config.VALID_LABELS:
+        count = len(train_df[train_df["label"] == label])
+        logger.info(f"  {Config.LABEL_NAMES[label]}: {count}")
+    
     return train_df, valid_df, test_df
+
+
+# =============================================================================
+# CLASS WEIGHTS FOR IMBALANCED DATA
+# =============================================================================
+
+def calculate_class_weights(logger: logging.Logger) -> torch.Tensor:
+    """
+    Calculate soft class weights to handle imbalanced data.
+    
+    Classes with fewer samples get higher weights so the model
+    pays more attention to them during training.
+    
+    We use "soft" weights (square root) to avoid over-emphasizing
+    rare classes too much.
+    """
+    counts = [Config.CLASS_COUNTS[i] for i in Config.VALID_LABELS]
+    total = sum(counts)
+    
+    # Calculate inverse frequency weights
+    # More samples = lower weight, fewer samples = higher weight
+    weights = [total / count for count in counts]
+    
+    # Apply "softening" with square root to avoid extreme weights
+    soft_weights = [w ** 0.5 for w in weights]
+    
+    # Normalize so weights sum to number of classes
+    weight_sum = sum(soft_weights)
+    normalized_weights = [w * len(counts) / weight_sum for w in soft_weights]
+    
+    # Convert to tensor and move to GPU
+    weights_tensor = torch.tensor(normalized_weights, dtype=torch.float32)
+    
+    if torch.cuda.is_available():
+        weights_tensor = weights_tensor.cuda()
+    
+    # Log the weights
+    logger.info("Calculated soft class weights:")
+    for i, label in enumerate(Config.VALID_LABELS):
+        logger.info(f"  {Config.LABEL_NAMES[label]}: {normalized_weights[i]:.3f}")
+    
+    return weights_tensor
+
+
+# =============================================================================
+# CREATE DATA LOADERS
+# =============================================================================
+
+def create_dataloaders(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    batch_size: int = Config.BATCH_SIZE,
+    image_size: int = Config.IMAGE_SIZE
+) -> ImageDataLoaders:
+    """
+    Create FastAI DataLoaders for training and validation.
+    
+    DataLoaders handle batching, shuffling, and data augmentation.
+    """
+    # Combine train and valid for FastAI's expected format
+    # We'll mark which rows are for validation
+    train_df = train_df.copy()
+    valid_df = valid_df.copy()
+    train_df["is_valid"] = False
+    valid_df["is_valid"] = True
+    combined_df = pd.concat([train_df, valid_df], ignore_index=True)
+    
+    # Create DataLoaders
+    dls = ImageDataLoaders.from_df(
+        df=combined_df,
+        path="",                          # Base path (empty since we have full paths)
+        fn_col="filepath",                # Column with file paths
+        label_col="label",                # Column with labels
+        valid_col="is_valid",             # Column marking validation set
+        item_tfms=None,                   # Item transforms (resizing done automatically)
+        batch_tfms=None,                  # Batch transforms (augmentation)
+        bs=batch_size,                    # Batch size
+        num_workers=Config.NUM_WORKERS,   # Parallel loading
+        seed=Config.SEED,                 # Random seed
+    )
+    
+    return dls
 
 
 # =============================================================================
 # MODEL TRAINING
 # =============================================================================
 
-
-def get_architecture(arch_name: str):
-    """Get FastAI architecture from string name."""
-    architectures = {
-        "resnet18": resnet18,
-        "resnet34": resnet34,
-        "resnet50": resnet50,
-        "densenet121": densenet121,
-        "efficientnet_b0": (
-            efficientnet_b0
-            if hasattr(sys.modules[__name__], "efficientnet_b0")
-            else resnet34
-        ),
-    }
-    return architectures.get(arch_name, resnet34)
-
-
-def create_dataloaders(
-    train_df: pd.DataFrame,
-    valid_df: pd.DataFrame,
-    config: Config,
-    batch_size: int = 64,
-    image_size: int = 224,
-) -> DataLoaders:
-    """Create FastAI DataLoaders from DataFrames."""
-
-    # Combine for DataBlock
-    combined_df = pd.concat(
-        [train_df.assign(is_valid=False), valid_df.assign(is_valid=True)]
-    ).reset_index(drop=True)
-
-    # Define DataBlock
-    dblock = DataBlock(
-        blocks=(ImageBlock, CategoryBlock),
-        get_x=ColReader("filepath"),
-        get_y=ColReader("label"),
-        splitter=ColSplitter("is_valid"),
-        item_tfms=Resize(image_size),
-        batch_tfms=[
-            *aug_transforms(
-                mult=1.0,
-                do_flip=True,
-                flip_vert=True,  # Pathology images can be any orientation
-                max_rotate=15.0,
-                max_zoom=1.1,
-                max_warp=0.1,
-                max_lighting=0.2,
-            ),
-            Normalize.from_stats(*imagenet_stats),
-        ],
-    )
-
-    # Create dataloaders - simple settings to avoid CUDA issues
-    # num_workers=0 means all data loading happens in main process
-    dls = dblock.dataloaders(combined_df, bs=batch_size, num_workers=0)
-
-    return dls
-
-
 def train_model(
-    dls: DataLoaders,
-    config: Config,
-    arch_name: str = "resnet34",
-    lr: float = 1e-3,
-    epochs: int = 10,
-    freeze_epochs: int = 1,
-    wd: float = 0.01,
-    mixup: float = 0.0,
-    save_path: Optional[Path] = None,
-    trial: Optional[optuna.Trial] = None,
-) -> Tuple[Learner, dict]:
+    dls: ImageDataLoaders,
+    class_weights: torch.Tensor,
+    learning_rate: float,
+    epochs: int,
+    architecture: str,
+    logger: logging.Logger
+) -> tuple[Learner, float]:
     """
-    Train a FastAI model with the given hyperparameters.
-    Uses mixed precision (FP16) for faster GPU training.
-
-    Returns:
-        Tuple of (learner, metrics_dict)
+    Train a model with the given hyperparameters.
+    
+    Returns the trained Learner and the best validation accuracy.
     """
-    arch = get_architecture(arch_name)
-
-    # Build learner with metrics
-    cbs = []
-    if trial is not None:
-        cbs.append(OptunaPruningCallback(trial, monitor="valid_loss"))
-
-    if save_path:
-        cbs.append(SaveModelCallback(monitor="valid_loss", fname="best_model"))
-
-    learn = cnn_learner(
+    # Select architecture
+    if architecture == "resnet34":
+        arch = resnet34
+    else:
+        arch = resnet50
+    
+    # Create weighted loss function
+    loss_func = CrossEntropyLossFlat(weight=class_weights)
+    
+    # Create the learner (model + data + optimizer)
+    learn = vision_learner(
         dls,
         arch,
-        metrics=[
-            accuracy,
-            F1Score(average="macro"),
-            Precision(average="macro"),
-            Recall(average="macro"),
-        ],
-        wd=wd,
-        cbs=cbs,
+        metrics=[accuracy, error_rate],
+        loss_func=loss_func,
+        pretrained=True  # Use pretrained ImageNet weights
     )
-
-    # Enable mixed precision training for faster GPU performance
-    if config.USE_FP16 and HAS_GPU:
-        learn = learn.to_fp16()
-
-    # Optional mixup
-    if mixup > 0:
-        learn = learn.add_cb(MixUp(mixup))
-
-    # Train: freeze first, then unfreeze
-    learn.freeze()
-    learn.fit_one_cycle(freeze_epochs, lr)
-
-    learn.unfreeze()
-    learn.fit_one_cycle(epochs - freeze_epochs, slice(lr / 100, lr / 10))
-
-    # Get final metrics
-    val_loss, acc, f1, prec, rec = learn.validate()
-
-    metrics = {
-        "valid_loss": float(val_loss),
-        "accuracy": float(acc),
-        "f1_macro": float(f1),
-        "precision_macro": float(prec),
-        "recall_macro": float(rec),
-    }
-
-    return learn, metrics
-
-
-# =============================================================================
-# EVALUATION
-# =============================================================================
-
-
-def evaluate_model(
-    learn: Learner, test_df: pd.DataFrame, config: Config, output_dir: Path
-) -> dict:
-    """
-    Evaluate model on test set and generate reports.
-
-    Returns:
-        Dictionary of test metrics
-    """
-    print("\n" + "=" * 60)
-    print("📊 EVALUATING ON TEST SET")
-    print("=" * 60)
-
-    # Create test dataloader
-    test_dl = learn.dls.test_dl(test_df["filepath"].tolist())
-
-    # Get predictions
-    preds, _ = learn.get_preds(dl=test_dl)
-    pred_labels = preds.argmax(dim=1).numpy()
-
-    # Map predictions back to class names
-    vocab = learn.dls.vocab
-    pred_names = [vocab[i] for i in pred_labels]
-    true_names = test_df["label"].tolist()
-
-    # Classification report
-    print("\n📋 Classification Report:")
-    print("-" * 60)
-    report = classification_report(
-        true_names, pred_names, output_dict=True, zero_division=0
-    )
-    print(classification_report(true_names, pred_names, zero_division=0))
-
-    # Save report
-    report_path = output_dir / "classification_report.json"
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\n✓ Report saved to {report_path}")
-
-    # Confusion Matrix
-    cm = confusion_matrix(true_names, pred_names, labels=vocab)
-
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        cm, annot=True, fmt="d", cmap="Blues", xticklabels=vocab, yticklabels=vocab
-    )
-    plt.title("Confusion Matrix - Test Set", fontsize=14)
-    plt.xlabel("Predicted", fontsize=12)
-    plt.ylabel("True", fontsize=12)
-    plt.xticks(rotation=45, ha="right")
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-
-    cm_path = output_dir / "confusion_matrix.png"
-    plt.savefig(cm_path, dpi=150)
-    plt.close()
-    print(f"✓ Confusion matrix saved to {cm_path}")
-
-    # Per-class metrics summary
-    print("\n📈 Per-Class Metrics:")
-    print("-" * 60)
-    print(
-        f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1-Score':>10} {'Support':>10}"
-    )
-    print("-" * 60)
-
-    for class_name in vocab:
-        if class_name in report:
-            m = report[class_name]
-            print(
-                f"{class_name:<25} {m['precision']:>10.3f} {m['recall']:>10.3f} {m['f1-score']:>10.3f} {m['support']:>10.0f}"
-            )
-
-    print("-" * 60)
-    print(
-        f"{'Macro Avg':<25} {report['macro avg']['precision']:>10.3f} {report['macro avg']['recall']:>10.3f} {report['macro avg']['f1-score']:>10.3f}"
-    )
-    print(
-        f"{'Weighted Avg':<25} {report['weighted avg']['precision']:>10.3f} {report['weighted avg']['recall']:>10.3f} {report['weighted avg']['f1-score']:>10.3f}"
-    )
-
-    return {
-        "test_accuracy": report["accuracy"],
-        "test_f1_macro": report["macro avg"]["f1-score"],
-        "test_precision_macro": report["macro avg"]["precision"],
-        "test_recall_macro": report["macro avg"]["recall"],
-    }
-
-
-# =============================================================================
-# TORCHSCRIPT EXPORT
-# =============================================================================
-
-
-def export_to_torchscript(
-    learn: Learner, output_dir: Path, image_size: int = 224
-) -> Optional[Path]:
-    """
-    Export FastAI model to TorchScript format for production deployment.
-
-    TorchScript advantages:
-    - No Python dependency at inference time
-    - Can run in C++/Java/other runtimes
-    - Optimized for production serving
-    - Smaller file size (no training state)
-
-    Returns:
-        Path to exported .pt file, or None if export failed
-    """
-    print("\n" + "-" * 60)
-    print("📦 EXPORTING TO TORCHSCRIPT")
-    print("-" * 60)
-
-    try:
-        # Get the PyTorch model from FastAI learner
-        model = learn.model.eval()
-
-        # Move to CPU for broader compatibility (can also export CUDA version)
-        model_cpu = model.cpu()
-
-        # Create example input tensor (batch_size=1, channels=3, height, width)
-        example_input = torch.randn(1, 3, image_size, image_size)
-
-        # Trace the model (records operations during forward pass)
-        with torch.no_grad():
-            traced_model = torch.jit.trace(model_cpu, example_input)
-
-        # Optimize for inference
-        traced_model = torch.jit.optimize_for_inference(traced_model)
-
-        # Save TorchScript model
-        torchscript_path = output_dir / "gleason_classifier_final.pt"
-        traced_model.save(str(torchscript_path))
-
-        # Also save class labels for inference
-        labels_path = output_dir / "class_labels.json"
-        class_labels = {i: label for i, label in enumerate(learn.dls.vocab)}
-        with open(labels_path, "w") as f:
-            json.dump(class_labels, f, indent=2)
-
-        # Report file sizes
-        pkl_size = (output_dir / "gleason_classifier_final.pkl").stat().st_size / 1e6
-        pt_size = torchscript_path.stat().st_size / 1e6
-
-        print(f"✓ TorchScript model saved to {torchscript_path}")
-        print(f"✓ Class labels saved to {labels_path}")
-        print(f"  FastAI .pkl size: {pkl_size:.1f} MB")
-        print(f"  TorchScript .pt size: {pt_size:.1f} MB")
-
-        # Move model back to GPU if available
-        if HAS_GPU:
-            learn.model.cuda()
-
-        return torchscript_path
-
-    except Exception as e:
-        print(f"⚠ TorchScript export failed: {e}")
-        print("  The .pkl model is still available for inference via FastAI.")
-        return None
-
-
-def load_torchscript_model(model_path: str, labels_path: str):
-    """
-    Example function showing how to load and use the TorchScript model.
-
-    Usage:
-        model, labels, transform = load_torchscript_model(
-            'output/gleason_classifier_final.pt',
-            'output/class_labels.json'
-        )
-
-        # Load and preprocess image
-        from PIL import Image
-        img = Image.open('test_image.png').convert('RGB')
-        input_tensor = transform(img).unsqueeze(0)
-
-        # Predict
-        with torch.no_grad():
-            output = model(input_tensor)
-            pred_idx = output.argmax(dim=1).item()
-            pred_label = labels[str(pred_idx)]
-            confidence = torch.softmax(output, dim=1)[0, pred_idx].item()
-
-        print(f"Predicted: {pred_label} ({confidence:.1%})")
-    """
-    from torchvision import transforms
-
-    # Load model
-    model = torch.jit.load(model_path)
-    model.eval()
-
-    # Load labels
-    with open(labels_path) as f:
-        labels = json.load(f)
-
-    # ImageNet normalization (same as training)
-    transform = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        learn.model.cuda()
+    
+    # Train with callbacks for saving best model and early stopping
+    learn.fine_tune(
+        epochs,
+        base_lr=learning_rate,
+        cbs=[
+            SaveModelCallback(monitor="valid_loss", fname="best_model"),
+            EarlyStoppingCallback(monitor="valid_loss", patience=5)
         ]
     )
-
-    return model, labels, transform
+    
+    # Get best validation accuracy
+    best_accuracy = max([m[1].item() for m in learn.recorder.values])
+    
+    return learn, best_accuracy
 
 
 # =============================================================================
-# OPTUNA HYPERPARAMETER OPTIMIZATION
+# HYPERPARAMETER OPTIMIZATION WITH OPTUNA
 # =============================================================================
 
-
-def optuna_objective(
-    trial: optuna.Trial, train_df: pd.DataFrame, valid_df: pd.DataFrame, config: Config
+def objective(
+    trial: optuna.Trial,
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    class_weights: torch.Tensor,
+    logger: logging.Logger
 ) -> float:
-    """Optuna objective function for hyperparameter optimization."""
-
-    # Suggest hyperparameters - larger batches for GPU
-    arch_name = trial.suggest_categorical(
-        "architecture", ["resnet18", "resnet34", "resnet50"]
-    )
-    batch_size = trial.suggest_categorical(
-        "batch_size", [32, 64, 128, 256]
-    )  # Larger batches for GPU
-    lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-    epochs = trial.suggest_int("epochs", 5, 15)
-    freeze_epochs = trial.suggest_int("freeze_epochs", 1, 3)
-    wd = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
-    mixup = trial.suggest_float("mixup", 0.0, 0.4)
-    image_size = trial.suggest_categorical("image_size", [224, 256, 320])
-
-    # Log trial parameters
-    print(
-        f"\n🔬 Trial {trial.number}: arch={arch_name}, bs={batch_size}, lr={lr:.2e}, epochs={epochs}"
-    )
-
+    """
+    Optuna objective function - tries different hyperparameter combinations.
+    
+    Returns the validation accuracy to maximize.
+    """
+    # Suggest hyperparameters to try
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    epochs = trial.suggest_int("epochs", 5, 20)
+    architecture = trial.suggest_categorical("architecture", ["resnet34", "resnet50"])
+    
+    logger.info(f"\n{'='*50}")
+    logger.info(f"Trial {trial.number + 1}")
+    logger.info(f"  Learning rate: {learning_rate:.6f}")
+    logger.info(f"  Batch size: {batch_size}")
+    logger.info(f"  Epochs: {epochs}")
+    logger.info(f"  Architecture: {architecture}")
+    logger.info(f"{'='*50}")
+    
     try:
-        # Create dataloaders with trial params
-        dls = create_dataloaders(train_df, valid_df, config, batch_size, image_size)
-
-        # Train model
-        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
-            mlflow.log_params(trial.params)
-
-            learn, metrics = train_model(
-                dls=dls,
-                config=config,
-                arch_name=arch_name,
-                lr=lr,
-                epochs=epochs,
-                freeze_epochs=freeze_epochs,
-                wd=wd,
-                mixup=mixup,
-                trial=trial,
-            )
-
-            mlflow.log_metrics(metrics)
-
-            # Clean up GPU memory
-            del learn
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-            return metrics["f1_macro"]
-
-    except optuna.TrialPruned:
-        # Re-raise pruning exception so Optuna handles it properly
-        raise
+        # Create data loaders with this batch size
+        dls = create_dataloaders(train_df, valid_df, batch_size=batch_size)
+        
+        # Train the model
+        learn, best_accuracy = train_model(
+            dls=dls,
+            class_weights=class_weights,
+            learning_rate=learning_rate,
+            epochs=epochs,
+            architecture=architecture,
+            logger=logger
+        )
+        
+        logger.info(f"Trial {trial.number + 1} - Best Accuracy: {best_accuracy:.4f}")
+        
+        # Clean up GPU memory
+        del learn
+        torch.cuda.empty_cache()
+        
+        return best_accuracy
+        
     except Exception as e:
-        print(f"  ❌ Trial failed: {e}")
+        logger.error(f"Trial {trial.number + 1} failed: {e}")
         return 0.0
 
 
 def run_hyperparameter_search(
-    train_df: pd.DataFrame, valid_df: pd.DataFrame, config: Config
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    class_weights: torch.Tensor,
+    logger: logging.Logger
 ) -> dict:
-    """Run Optuna hyperparameter optimization."""
-
-    print("\n" + "=" * 60)
-    print("🔍 HYPERPARAMETER OPTIMIZATION (OPTUNA)")
-    print("=" * 60)
-    print(
-        f"\nRunning {config.N_OPTUNA_TRIALS} trials (timeout: {config.OPTUNA_TIMEOUT}s)"
-    )
-
-    # Create Optuna study
+    """
+    Run Optuna hyperparameter optimization.
+    
+    Returns the best hyperparameters found.
+    """
+    logger.info("\n" + "="*60)
+    logger.info("STARTING HYPERPARAMETER OPTIMIZATION")
+    logger.info("="*60)
+    
+    # Create Optuna study (we want to MAXIMIZE accuracy)
     study = optuna.create_study(
         direction="maximize",
-        study_name="gleason_classifier",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=2),
+        study_name="gleason_classification"
     )
-
-    # Optimize
+    
+    # Run optimization
     study.optimize(
-        lambda trial: optuna_objective(trial, train_df, valid_df, config),
-        n_trials=config.N_OPTUNA_TRIALS,
-        timeout=config.OPTUNA_TIMEOUT,
-        show_progress_bar=True,
+        lambda trial: objective(trial, train_df, valid_df, class_weights, logger),
+        n_trials=Config.NUM_TRIALS,
+        show_progress_bar=True
     )
-
-    # Report results
-    print("\n" + "=" * 60)
-    print("🏆 BEST HYPERPARAMETERS")
-    print("=" * 60)
-    print(f"\nBest F1 Score: {study.best_value:.4f}")
-    print("\nBest parameters:")
+    
+    # Log results
+    logger.info("\n" + "="*60)
+    logger.info("HYPERPARAMETER OPTIMIZATION COMPLETE")
+    logger.info("="*60)
+    logger.info(f"Best trial accuracy: {study.best_value:.4f}")
+    logger.info("Best hyperparameters:")
     for key, value in study.best_params.items():
-        print(f"   {key}: {value}")
-
+        logger.info(f"  {key}: {value}")
+    
     return study.best_params
 
 
 # =============================================================================
-# MAIN PIPELINE
+# MODEL EVALUATION
 # =============================================================================
 
+def evaluate_model(
+    learn: Learner,
+    test_df: pd.DataFrame,
+    logger: logging.Logger,
+    output_path: Path
+) -> dict:
+    """
+    Evaluate the trained model on the test set.
+    
+    Returns a dictionary with all evaluation metrics.
+    """
+    logger.info("\n" + "="*60)
+    logger.info("EVALUATING MODEL ON TEST SET")
+    logger.info("="*60)
+    
+    # Create test dataloader
+    test_dl = learn.dls.test_dl(test_df["filepath"].tolist())
+    
+    # Get predictions
+    preds, targets = learn.get_preds(dl=test_dl)
+    predicted_labels = preds.argmax(dim=1).cpu().numpy()
+    true_labels = test_df["label"].values
+    
+    # Calculate metrics
+    test_accuracy = (predicted_labels == true_labels).mean()
+    f1 = f1_score(true_labels, predicted_labels, average="weighted")
+    
+    # Confusion Matrix
+    cm = confusion_matrix(true_labels, predicted_labels)
+    
+    # Per-class metrics
+    class_report = classification_report(
+        true_labels,
+        predicted_labels,
+        target_names=[Config.LABEL_NAMES[i] for i in Config.VALID_LABELS],
+        output_dict=True
+    )
+    
+    # Log results
+    logger.info(f"\nTest Accuracy: {test_accuracy:.4f}")
+    logger.info(f"Weighted F1 Score: {f1:.4f}")
+    
+    logger.info("\nConfusion Matrix:")
+    logger.info("(Rows = True Labels, Columns = Predicted Labels)")
+    header = "          " + " ".join([f"{Config.LABEL_NAMES[i][:8]:>8}" for i in Config.VALID_LABELS])
+    logger.info(header)
+    for i, row in enumerate(cm):
+        row_str = f"{Config.LABEL_NAMES[Config.VALID_LABELS[i]][:8]:>8}: " + " ".join([f"{val:>8}" for val in row])
+        logger.info(row_str)
+    
+    logger.info("\nPer-Class Metrics:")
+    logger.info(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1-Score':>10} {'Support':>10}")
+    logger.info("-" * 62)
+    for label in Config.VALID_LABELS:
+        name = Config.LABEL_NAMES[label]
+        metrics = class_report[name]
+        logger.info(f"{name:<20} {metrics['precision']:>10.3f} {metrics['recall']:>10.3f} {metrics['f1-score']:>10.3f} {int(metrics['support']):>10}")
+    
+    # Save confusion matrix as CSV
+    cm_df = pd.DataFrame(
+        cm,
+        index=[Config.LABEL_NAMES[i] for i in Config.VALID_LABELS],
+        columns=[Config.LABEL_NAMES[i] for i in Config.VALID_LABELS]
+    )
+    cm_path = output_path / "confusion_matrix.csv"
+    cm_df.to_csv(cm_path)
+    logger.info(f"\nConfusion matrix saved to: {cm_path}")
+    
+    # Save per-class metrics as CSV
+    metrics_df = pd.DataFrame(class_report).transpose()
+    metrics_path = output_path / "per_class_metrics.csv"
+    metrics_df.to_csv(metrics_path)
+    logger.info(f"Per-class metrics saved to: {metrics_path}")
+    
+    return {
+        "accuracy": test_accuracy,
+        "f1_score": f1,
+        "confusion_matrix": cm,
+        "class_report": class_report
+    }
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
 
 def main():
-    """Main training pipeline."""
-    global HAS_GPU
+    """
+    Main function that runs the entire training pipeline.
+    """
+    # Start timing
+    start_time = time.time()
     
-    # Setup hardware FIRST, before any other operations
-    HAS_GPU = setup_hardware()
+    # Setup
+    logger = setup_logging(Config.OUTPUT_PATH)
+    logger.info("="*60)
+    logger.info("GLEASON SCORE CLASSIFICATION PIPELINE")
+    logger.info("="*60)
+    
+    # Check GPU
+    device = setup_gpu(logger)
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(Config.SEED)
+    np.random.seed(Config.SEED)
+    
+    # Load and split data
+    train_df, valid_df, test_df = load_and_split_data(Config.DATA_PATH, logger)
+    
+    # Calculate class weights for imbalanced data
+    class_weights = calculate_class_weights(logger)
+    
+    # Run hyperparameter optimization
+    best_params = run_hyperparameter_search(
+        train_df, valid_df, class_weights, logger
+    )
+    
+    # Train final model with best hyperparameters
+    logger.info("\n" + "="*60)
+    logger.info("TRAINING FINAL MODEL WITH BEST HYPERPARAMETERS")
+    logger.info("="*60)
+    
+    # Create data loaders with best batch size
+    dls = create_dataloaders(
+        train_df, valid_df,
+        batch_size=best_params["batch_size"]
+    )
+    
+    # Train final model
+    final_learner, final_accuracy = train_model(
+        dls=dls,
+        class_weights=class_weights,
+        learning_rate=best_params["learning_rate"],
+        epochs=best_params["epochs"],
+        architecture=best_params["architecture"],
+        logger=logger
+    )
+    
+    logger.info(f"Final model validation accuracy: {final_accuracy:.4f}")
+    
+    # Evaluate on test set
+    eval_results = evaluate_model(final_learner, test_df, logger, Config.OUTPUT_PATH)
+    
+    # Save the best model
+    model_path = Config.OUTPUT_PATH / "best_model.pkl"
+    final_learner.export(model_path)
+    logger.info(f"\nBest model saved to: {model_path}")
+    
+    # Calculate total time
+    total_time = time.time() - start_time
+    hours, remainder = divmod(total_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    # Final summary
+    logger.info("\n" + "="*60)
+    logger.info("TRAINING COMPLETE - SUMMARY")
+    logger.info("="*60)
+    logger.info(f"Total execution time: {int(hours)}h {int(minutes)}m {seconds:.1f}s")
+    logger.info(f"Best validation accuracy: {final_accuracy:.4f}")
+    logger.info(f"Test accuracy: {eval_results['accuracy']:.4f}")
+    logger.info(f"Test F1 score: {eval_results['f1_score']:.4f}")
+    logger.info(f"Model saved to: {model_path}")
+    logger.info(f"Logs saved to: {Config.OUTPUT_PATH}")
+    logger.info("="*60)
+    
+    return final_learner, eval_results
 
-    print("\n" + "=" * 60)
-    print("🔬 GLEASON SCORE CLASSIFIER")
-    print("    FastAI + Optuna + MLflow")
-    print("=" * 60)
 
-    config = Config()
-
-    # Create output directory
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Setup MLflow
-    mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(config.MLFLOW_EXPERIMENT)
-
-    # Prepare dataset
-    train_df, valid_df, test_df = prepare_dataset(config.IMAGE_DIR, config)
-
-    # Save splits for reproducibility
-    train_df.to_csv(config.OUTPUT_DIR / "train_split.csv", index=False)
-    valid_df.to_csv(config.OUTPUT_DIR / "valid_split.csv", index=False)
-    test_df.to_csv(config.OUTPUT_DIR / "test_split.csv", index=False)
-    print(f"\n✓ Data splits saved to {config.OUTPUT_DIR}")
-
-    # Start main MLflow run
-    with mlflow.start_run(
-        run_name=f"gleason_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    ):
-
-        # Log config including hardware
-        mlflow.log_params(
-            {
-                "test_size": config.TEST_SIZE,
-                "valid_size": config.VALID_SIZE,
-                "n_train": len(train_df),
-                "n_valid": len(valid_df),
-                "n_test": len(test_df),
-                "n_optuna_trials": config.N_OPTUNA_TRIALS,
-                "num_workers": config.NUM_WORKERS,
-                "use_fp16": config.USE_FP16,
-                "gpu_available": HAS_GPU,
-                "gpu_name": torch.cuda.get_device_name(0) if HAS_GPU else "None",
-            }
-        )
-
-        # Run hyperparameter search
-        best_params = run_hyperparameter_search(train_df, valid_df, config)
-        mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
-
-        # Train final model with best parameters
-        print("\n" + "=" * 60)
-        print("🚀 TRAINING FINAL MODEL WITH BEST PARAMETERS")
-        print("=" * 60)
-
-        dls = create_dataloaders(
-            train_df,
-            valid_df,
-            config,
-            batch_size=best_params.get("batch_size", 32),
-            image_size=best_params.get("image_size", 224),
-        )
-
-        learn, metrics = train_model(
-            dls=dls,
-            config=config,
-            arch_name=best_params.get("architecture", "resnet34"),
-            lr=best_params.get("learning_rate", 1e-3),
-            epochs=best_params.get("epochs", 10),
-            freeze_epochs=best_params.get("freeze_epochs", 1),
-            wd=best_params.get("weight_decay", 0.01),
-            mixup=best_params.get("mixup", 0.0),
-            save_path=config.OUTPUT_DIR,
-        )
-
-        mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
-
-        # Evaluate on test set
-        test_metrics = evaluate_model(learn, test_df, config, config.OUTPUT_DIR)
-        mlflow.log_metrics(test_metrics)
-
-        # Save final model as FastAI .pkl
-        model_path = config.OUTPUT_DIR / "gleason_classifier_final.pkl"
-        learn.export(model_path)
-        print(f"\n✓ FastAI model saved to {model_path}")
-        mlflow.log_artifact(str(model_path))
-
-        # Export to TorchScript for production deployment
-        torchscript_path = export_to_torchscript(
-            learn, config.OUTPUT_DIR, config.IMAGE_SIZE
-        )
-        if torchscript_path:
-            mlflow.log_artifact(str(torchscript_path))
-
-        # Log confusion matrix
-        mlflow.log_artifact(str(config.OUTPUT_DIR / "confusion_matrix.png"))
-        mlflow.log_artifact(str(config.OUTPUT_DIR / "classification_report.json"))
-
-        # Summary
-        print("\n" + "=" * 60)
-        print("✅ TRAINING COMPLETE")
-        print("=" * 60)
-        print("\n📊 Final Test Metrics:")
-        print(f"   Accuracy:  {test_metrics['test_accuracy']:.4f}")
-        print(f"   F1 (macro): {test_metrics['test_f1_macro']:.4f}")
-        print(f"   Precision: {test_metrics['test_precision_macro']:.4f}")
-        print(f"   Recall:    {test_metrics['test_recall_macro']:.4f}")
-        print(f"\n📁 Outputs saved to: {config.OUTPUT_DIR}")
-        print(
-            f"🔗 MLflow UI: run 'mlflow ui --backend-store-uri {config.MLFLOW_TRACKING_URI}'"
-        )
-
+# =============================================================================
+# RUN THE SCRIPT
+# =============================================================================
 
 if __name__ == "__main__":
-    main()
+    # This block runs when you execute the script directly
+    learner, results = main()

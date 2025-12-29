@@ -1,234 +1,128 @@
 # Gleason Score Image Classifier
 
-A complete pipeline for training a Gleason score classifier using **FastAI**, **Optuna**, and **MLflow**.
+A machine learning pipeline for classifying prostate cancer histopathology images by Gleason score.
 
-## Features
+## Overview
 
-- ✅ **Automatic corrupt image detection** - skips invalid PNGs
-- ✅ **Label extraction from filenames** - parses `_0.png` through `_5.png` suffixes
-- ✅ **Stratified train/validation/test splits** - maintains class distribution
-- ✅ **Hyperparameter optimization** - Optuna finds optimal architecture, learning rate, batch size, etc.
-- ✅ **Experiment tracking** - MLflow logs all runs, parameters, and artifacts
-- ✅ **Comprehensive evaluation** - confusion matrix, per-class metrics, classification report
-- ✅ **Model export** - saves best model as `.pkl` for inference
+This pipeline uses:
 
-## Quick Start
+- **FastAI** - Makes deep learning accessible and fast
+- **Optuna** - Automatically finds the best hyperparameters
+- **ResNet** - Proven image classification architecture
 
-### 1. Install Dependencies
+## Gleason Score Labels
 
-```bash
-uv sync
-```
+| Label | Description |
+|-------|-------------|
+| 0 | Benign |
+| 1 | Gleason 3 |
+| 2 | Gleason 4 |
+| 3 | Gleason 5-Single Cells |
+| 4 | Gleason 5-Secretions (SKIPPED) |
+| 5 | Gleason 5 (SKIPPED) |
 
-### 2. Organize Your Images
+## Requirements
 
-Place all your PNG images in a single folder. The script extracts labels from filename suffixes (`*-{label}.png` or `*_{label}.png`):
+- Python 3.9+
+- NVIDIA GPU with CUDA support
+- At least 8GB GPU memory recommended
 
-| Label | Class | Status |
-|-------|-------|--------|
-| `*_0.png` | Benign | ✓ Used |
-| `*_1.png` | Gleason 3 | ✓ Used |
-| `*_2.png` | Gleason 4 | ✓ Used |
-| `*_3.png` | Gleason 5 - Single Cells | ✓ Used |
-| `*_4.png` | Gleason 5 - Secretions | ⊘ Skipped |
-| `*_5.png` | Gleason 5 | ⊘ Skipped |
-
-**Note:** Labels 4 and 5 are automatically skipped during training (configured in `Config.SKIP_LABELS`).
-
-### 3. Configure the Script
-
-Edit the `Config` class in `gleason_classifier.py`:
-
-```python
-class Config:
-    IMAGE_DIR = Path("/path/to/your/gleason_images")  # <-- Update this
-    OUTPUT_DIR = Path("./output")
-    
-    # Adjust label names if needed
-    LABEL_MAP = {
-        0: "benign",
-        1: "gleason_3_3",
-        # ...
-    }
-    
-    # Optuna settings
-    N_OPTUNA_TRIALS = 20  # More trials = better hyperparameters (but slower)
-```
-
-### 4. Run Training
+## Installation
 
 ```bash
+# Create a virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Data Setup
+
+1. Place images in the `./gleason_images` folder
+2. Images should be named with the pattern: `*-{label}.png`
+   - Example: `patient001_patch042-2.png` (label = 2, Gleason 4)
+
+## Usage
+
+```bash
+# Run the training pipeline
 python gleason_classifier.py
 ```
 
-### 5. View Results
+## Configuration
 
-**MLflow UI:**
-
-```bash
-mlflow ui --backend-store-uri ./mlruns
-# Open http://localhost:5000 in browser
-```
-
-**Output files in `./output/`:**
-
-- `gleason_classifier_final.pkl` - Trained model (use with `fastai.load_learner()`)
-- `confusion_matrix.png` - Visual confusion matrix
-- `classification_report.json` - Per-class precision/recall/F1
-- `train_split.csv`, `valid_split.csv`, `test_split.csv` - Data splits for reproducibility
-
-## Using the Trained Model
-
-### Option 1: FastAI (.pkl) - Easy Python inference
-
-```python
-from fastai.vision.all import *
-
-# Load model
-learn = load_learner('output/gleason_classifier_final.pkl')
-
-# Predict on new image
-pred_class, pred_idx, probs = learn.predict('path/to/new_image.png')
-print(f"Predicted: {pred_class} (confidence: {probs[pred_idx]:.2%})")
-```
-
-### Option 2: TorchScript (.pt) - Production deployment
-
-TorchScript models are better for production:
-
-- No FastAI/Python dependency at inference
-- Can run in C++, Java, mobile (via PyTorch Mobile)
-- Optimized and smaller file size
-
-```python
-import torch
-from torchvision import transforms
-from PIL import Image
-import json
-
-# Load model and labels
-model = torch.jit.load('output/gleason_classifier_final.pt')
-model.eval()
-
-with open('output/class_labels.json') as f:
-    labels = json.load(f)
-
-# Preprocessing (must match training)
-transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-# Predict
-img = Image.open('test_image.png').convert('RGB')
-input_tensor = transform(img).unsqueeze(0)
-
-with torch.no_grad():
-    output = model(input_tensor)
-    pred_idx = output.argmax(dim=1).item()
-    confidence = torch.softmax(output, dim=1)[0, pred_idx].item()
-
-print(f"Predicted: {labels[str(pred_idx)]} ({confidence:.1%})")
-```
-
-### Option 3: GPU inference with TorchScript
-
-```python
-model = torch.jit.load('output/gleason_classifier_final.pt')
-model = model.cuda()
-input_tensor = transform(img).unsqueeze(0).cuda()
-
-with torch.no_grad():
-    output = model(input_tensor)
-```
-
-## Hyperparameters Tuned by Optuna
-
-| Parameter | Search Space |
-|-----------|--------------|
-| Architecture | ResNet18, ResNet34, ResNet50 |
-| Batch size | 16, 32, 64 |
-| Learning rate | 1e-5 to 1e-2 (log scale) |
-| Epochs | 5 to 15 |
-| Freeze epochs | 1 to 3 |
-| Weight decay | 1e-4 to 1e-1 (log scale) |
-| Mixup alpha | 0.0 to 0.4 |
-| Image size | 224, 256, 320 |
-
-## Handling Class Imbalance
-
-Your dataset has significant class imbalance (815 `_3.png` vs 26,816 `_1.png`). The script addresses this with:
-
-1. **Stratified splitting** - ensures all classes represented in train/val/test
-2. **Data augmentation** - flips, rotations, zoom help minority classes
-3. **Mixup regularization** - Optuna can enable this for better generalization
-4. **Macro-averaged metrics** - F1, precision, recall treat all classes equally
-
-For severe imbalance, consider adding weighted loss (modify `train_model()`):
-
-```python
-# Add to train_model() after creating learner
-class_weights = torch.tensor([...])  # Higher weights for rare classes
-learn.loss_func = CrossEntropyLossFlat(weight=class_weights)
-```
-
-## GPU Support
-
-The script is **optimized for GPU training** with:
-
-- **Mixed precision (FP16)** - 2x faster training on modern GPUs
-- **cuDNN benchmark mode** - automatically finds fastest convolution algorithms
-- **TF32 support** - enabled for Ampere+ GPUs (RTX 30xx, A100, etc.)
-- **Large batch sizes** - Optuna searches 32, 64, 128, 256
-
-### Hardware Configuration
-
-The script is configured for **64 CPU workers** for data loading. Edit these in `Config` if needed:
+Edit the `Config` class in `gleason_classifier.py` to change:
 
 ```python
 class Config:
-    NUM_WORKERS = 64       # CPU workers for data loading (set to cores - 4)
-    PIN_MEMORY = True      # Faster GPU transfer
-    PREFETCH_FACTOR = 4    # Batches to prefetch per worker
-    USE_FP16 = True        # Mixed precision training
+    DATA_PATH = Path("./gleason_images") # Image folder
+    OUTPUT_PATH = Path("./output")    # Where results are saved
+    NUM_TRIALS = 20                   # Optuna optimization trials
+    BATCH_SIZE = 32                   # Reduce if GPU runs out of memory
 ```
 
-### Verify GPU detection
+## Output Files
+
+After training, you'll find in `./output/`:
+
+- `best_model.pkl` - The trained model
+- `training_log_*.txt` - Detailed training logs
+- `confusion_matrix.csv` - Model predictions vs actual
+- `per_class_metrics.csv` - Precision, recall, F1 per class
+
+## Understanding the Code
+
+### Key Concepts
+
+1. **Class Weights**: Since the data is imbalanced (some classes have more images), we give higher weights to rare classes so the model learns them better.
+
+2. **Data Split**: 
+   - Training (70%): Model learns from these
+   - Validation (15%): Checks performance during training
+   - Test (15%): Final evaluation on unseen data
+
+3. **Hyperparameters**: Settings like learning rate that affect training. Optuna finds the best ones automatically.
+
+4. **Transfer Learning**: We start with a model pre-trained on ImageNet, then fine-tune it for our task. This is faster and works better with limited data.
+
+### Pipeline Steps
+
+1. **Setup** - Initialize logging, check GPU
+2. **Load Data** - Read images, extract labels, split data
+3. **Calculate Weights** - Handle class imbalance
+4. **Hyperparameter Search** - Try different settings
+5. **Train Final Model** - Use best settings
+6. **Evaluate** - Test on held-out data
+7. **Save** - Export model and metrics
+
+## Loading a Trained Model
 
 ```python
-import torch
-print(f"CUDA available: {torch.cuda.is_available()}")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-```
+from fastai.vision.all import load_learner
 
-At startup, the script prints hardware info:
+# Load the saved model
+learn = load_learner("./output/best_model.pkl")
 
-```
-🖥️  GPU: NVIDIA A100-SXM4-80GB (80.0 GB) x 1
-💻 CPU cores available: 72
+# Make predictions
+predictions = learn.predict("path/to/image.png")
+print(f"Predicted class: {predictions[0]}")
+print(f"Confidence: {predictions[2].max():.2%}")
 ```
 
 ## Troubleshooting
 
-**Out of memory:**
+### "CUDA out of memory"
+- Reduce `BATCH_SIZE` in Config (try 16 or 8)
+- Use ResNet34 instead of ResNet50
 
-- Reduce `batch_size` in Config or Optuna search space
-- Use smaller `image_size` (e.g., 192)
-- Use smaller architecture (ResNet18)
+### "No GPU found"
+- Install CUDA toolkit
+- Check `torch.cuda.is_available()` returns True
 
-**Training too slow:**
-
-- Reduce `N_OPTUNA_TRIALS`
-- Reduce `epochs` range in Optuna
-- Use fewer images for initial testing
-
-**Poor accuracy on minority classes:**
-
-- Increase `N_OPTUNA_TRIALS` for better hyperparameters
-- Try adding class weights (see above)
-- Consider oversampling minority classes
+### Corrupt images cause errors
+- The pipeline automatically skips corrupt images
+- Check logs for which files were skipped
 
 <br>

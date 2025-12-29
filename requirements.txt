@@ -1,27 +1,22 @@
-# Gleason Score Classifier Dependencies
-# ======================================
+# Gleason Classifier Dependencies
 # Install with: pip install -r requirements.txt
 
-# Core ML frameworks
-fastai>=2.7.0
+# Core ML libraries
 torch>=2.0.0
 torchvision>=0.15.0
 
-# Hyperparameter optimization
+# FastAI for easy deep learning
+fastai>=2.7.0
+
+# Optuna for hyperparameter tuning
 optuna>=3.0.0
-optuna-integration[fastaiv2]
 
-# Experiment tracking
-mlflow>=2.0.0
-
-# Data processing
+# Data handling
 pandas>=2.0.0
 numpy>=1.24.0
-scikit-learn>=1.3.0
 
-# Image handling
+# Image processing
 Pillow>=10.0.0
 
-# Visualization
-matplotlib>=3.7.0
-seaborn>=0.12.0
+# Metrics and evaluation
+scikit-learn>=1.3.0

@@ -36,7 +36,6 @@ from fastai.vision.all import (
     accuracy,
     error_rate,
     vision_learner,
-    resnet34,
     resnet50,
     CrossEntropyLossFlat,
     ClassificationInterpretation,
@@ -385,7 +384,6 @@ def train_model(
     class_weights: torch.Tensor,
     learning_rate: float,
     epochs: int,
-    architecture: str,
     logger: logging.Logger
 ) -> tuple[Learner, float]:
     """
@@ -393,11 +391,8 @@ def train_model(
     
     Returns the trained Learner and the best validation accuracy.
     """
-    # Select architecture
-    if architecture == "resnet34":
-        arch = resnet34
-    else:
-        arch = resnet50
+    # Use ResNet50 - deeper network for complex histopathology patterns
+    arch = resnet50
     
     # Create weighted loss function
     loss_func = CrossEntropyLossFlat(weight=class_weights)
@@ -462,14 +457,13 @@ def objective(
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     epochs = trial.suggest_int("epochs", 5, 20)
-    architecture = trial.suggest_categorical("architecture", ["resnet34", "resnet50"])
     
     logger.info(f"\n{'='*50}")
     logger.info(f"Trial {trial.number + 1}")
     logger.info(f"  Learning rate: {learning_rate:.6f}")
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Epochs: {epochs}")
-    logger.info(f"  Architecture: {architecture}")
+    logger.info(f"  Architecture: ResNet50")
     logger.info(f"{'='*50}")
     
     try:
@@ -482,7 +476,6 @@ def objective(
             class_weights=class_weights,
             learning_rate=learning_rate,
             epochs=epochs,
-            architecture=architecture,
             logger=logger
         )
         
@@ -677,7 +670,6 @@ def main():
         class_weights=class_weights,
         learning_rate=best_params["learning_rate"],
         epochs=best_params["epochs"],
-        architecture=best_params["architecture"],
         logger=logger
     )
     

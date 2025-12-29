@@ -41,7 +41,9 @@ from fastai.vision.all import (
     ClassificationInterpretation,
     SaveModelCallback,
     EarlyStoppingCallback,
+    set_seed,
 )
+from fastai.torch_core import default_device, set_default_device
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -150,7 +152,7 @@ def setup_gpu(logger: logging.Logger) -> torch.device:
     Check for GPU availability and set up the device.
     
     GPUs make training much faster - this function ensures
-    we're using one if available.
+    we're using one if available and sets it as the default.
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -158,10 +160,15 @@ def setup_gpu(logger: logging.Logger) -> torch.device:
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info(f"✓ GPU Found: {gpu_name}")
         logger.info(f"  GPU Memory: {gpu_memory:.1f} GB")
+        
+        # THIS IS THE KEY: Set default device for FastAI
+        set_default_device(device)
+        logger.info(f"  Default device set to: {default_device()}")
     else:
         logger.error("✗ No GPU found! Training will be very slow.")
         logger.error("  Please ensure CUDA is installed and a GPU is available.")
         device = torch.device("cpu")
+        set_default_device(device)
     
     return device
 
@@ -358,7 +365,7 @@ def create_dataloaders(
     valid_df["is_valid"] = True
     combined_df = pd.concat([train_df, valid_df], ignore_index=True)
     
-    # Create DataLoaders
+    # Create DataLoaders with explicit device
     dls = ImageDataLoaders.from_df(
         df=combined_df,
         path="",                          # Base path (empty since we have full paths)
@@ -368,8 +375,9 @@ def create_dataloaders(
         item_tfms=None,                   # Item transforms (resizing done automatically)
         batch_tfms=None,                  # Batch transforms (augmentation)
         bs=batch_size,                    # Batch size
-        num_workers=Config.NUM_WORKERS,   # Parallel loading
+        num_workers=Config.NUM_WORKERS,   # Parallel data loading workers
         seed=Config.SEED,                 # Random seed
+        device=default_device(),          # USE GPU!
     )
     
     return dls
@@ -398,17 +406,14 @@ def train_model(
     loss_func = CrossEntropyLossFlat(weight=class_weights)
     
     # Create the learner (model + data + optimizer)
+    # FastAI will automatically use the default device we set earlier
     learn = vision_learner(
         dls,
         arch,
         metrics=[accuracy, error_rate],
         loss_func=loss_func,
         pretrained=True  # Use pretrained ImageNet weights
-    )
-    
-    # Move to GPU if available
-    if torch.cuda.is_available():
-        learn.model.cuda()
+    ).to_fp16()  # Use mixed precision for faster training on GPU
     
     # Train with callbacks for saving best model and early stopping
     learn.fine_tune(

@@ -95,8 +95,8 @@ That way:
 
 If you're iterating *right now* and want velocity:
 
-**Cut to ResNet50 only.**
-Ship results.
+**Cut to ResNet50 only.**  
+Ship results.  
 Re-introduce ResNet34 *only* if something smells off (overfitting, instability, weird class collapse).
 
 This isn't dogma — it's pragmatism.

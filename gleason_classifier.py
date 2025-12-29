@@ -61,7 +61,7 @@ class Config:
     """All settings in one place for easy modification."""
     
     # Path to your image folder (change this to your data location)
-    DATA_PATH = Path("./data")
+    DATA_PATH = Path("./gleason_images")
     
     # Where to save results
     OUTPUT_PATH = Path("./output")
@@ -100,6 +100,9 @@ class Config:
     
     # Random seed for reproducibility
     SEED = 42
+    
+    # Skip image validation for faster loading (set False if you have corrupt images)
+    SKIP_IMAGE_VALIDATION = True
 
 
 # =============================================================================
@@ -190,7 +193,9 @@ def is_valid_image(filepath: Path, logger: logging.Logger) -> bool:
     """
     try:
         with Image.open(filepath) as img:
-            img.verify()  # Verify the image is not corrupted
+            # Load the image data to verify it's not corrupted
+            # (verify() alone doesn't always catch issues)
+            img.load()
         return True
     except Exception as e:
         logger.warning(f"Skipping corrupt image: {filepath.name} - {e}")
@@ -212,6 +217,13 @@ def load_and_split_data(
     all_files = list(data_path.glob("**/*.png"))
     logger.info(f"Found {len(all_files)} total PNG files")
     
+    # Show a sample filename for debugging
+    if all_files:
+        sample = all_files[0].name
+        sample_label = extract_label_from_filename(sample)
+        logger.info(f"Sample filename: {sample}")
+        logger.info(f"Extracted label: {sample_label}")
+    
     # Filter and validate images
     valid_data = []
     skipped_labels = Counter()
@@ -221,15 +233,16 @@ def load_and_split_data(
         # Extract label from filename
         label = extract_label_from_filename(filepath.name)
         
-        # Skip invalid labels (4 and 5)
+        # Skip invalid labels (4 and 5, or unrecognized)
         if label not in Config.VALID_LABELS:
             skipped_labels[label] += 1
             continue
         
-        # Skip corrupt images
-        if not is_valid_image(filepath, logger):
-            corrupt_count += 1
-            continue
+        # Optionally skip corrupt images (slower but safer)
+        if not Config.SKIP_IMAGE_VALIDATION:
+            if not is_valid_image(filepath, logger):
+                corrupt_count += 1
+                continue
         
         valid_data.append({
             "filepath": str(filepath),
@@ -239,9 +252,13 @@ def load_and_split_data(
     
     # Log summary
     logger.info(f"Valid images: {len(valid_data)}")
-    logger.info(f"Corrupt images skipped: {corrupt_count}")
+    if not Config.SKIP_IMAGE_VALIDATION:
+        logger.info(f"Corrupt images skipped: {corrupt_count}")
     for label, count in sorted(skipped_labels.items()):
-        logger.info(f"Skipped label {label}: {count} images")
+        if label == -1:
+            logger.info(f"Skipped (unrecognized format): {count} images")
+        else:
+            logger.info(f"Skipped label {label}: {count} images")
     
     # Create DataFrame and shuffle
     df = pd.DataFrame(valid_data)
@@ -261,6 +278,12 @@ def load_and_split_data(
     logger.info(f"Train set: {len(train_df)} images ({Config.TRAIN_RATIO*100:.0f}%)")
     logger.info(f"Valid set: {len(valid_df)} images ({Config.VALID_RATIO*100:.0f}%)")
     logger.info(f"Test set: {len(test_df)} images ({Config.TEST_RATIO*100:.0f}%)")
+    
+    # Check if we have any data
+    if len(train_df) == 0:
+        logger.error("No valid training images found! Check your data path and filename format.")
+        logger.error(f"Expected filename format: *_{{label}}.png where label is in {Config.VALID_LABELS}")
+        raise ValueError("No valid training images found")
     
     # Log class distribution in training set
     logger.info("Training set class distribution:")

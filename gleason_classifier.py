@@ -61,7 +61,7 @@ class Config:
     """All settings in one place for easy modification."""
     
     # Path to your image folder (change this to your data location)
-    DATA_PATH = Path("./gleason_images")
+    DATA_PATH = Path("./data")
     
     # Where to save results
     OUTPUT_PATH = Path("./output")
@@ -172,11 +172,11 @@ def extract_label_from_filename(filename: str) -> int:
     """
     Extract the label from an image filename.
     
-    Expected format: anything-{label}.png
-    Example: "image_001-2.png" -> label 2
+    Expected format: anything_{label}.png
+    Example: "001738-000001_01_20180504-multires.tif_17922_54662_239_250_0.png" -> label 0
     """
-    # Find the pattern "-{digit}.png" at the end of filename
-    match = re.search(r"-(\d)\.png$", filename, re.IGNORECASE)
+    # Find the pattern "_{digit}.png" at the end of filename
+    match = re.search(r"_(\d)\.png$", filename, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return -1  # Invalid label

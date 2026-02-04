@@ -15,7 +15,6 @@ Gleason Scores (labels):
 Author: Generated for educational purposes
 """
 
-import os
 import re
 import time
 import logging
@@ -38,10 +37,8 @@ from fastai.vision.all import (
     vision_learner,
     resnet50,
     CrossEntropyLossFlat,
-    ClassificationInterpretation,
     SaveModelCallback,
     EarlyStoppingCallback,
-    set_seed,
 )
 from fastai.torch_core import default_device, set_default_device
 from sklearn.metrics import (
@@ -459,7 +456,7 @@ def objective(
     logger.info(f"  Learning rate: {learning_rate:.6f}")
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Epochs: {epochs}")
-    logger.info(f"  Architecture: ResNet50")
+    logger.info("  Architecture: ResNet50")
     logger.info(f"{'='*50}")
     
     try:
@@ -632,7 +629,7 @@ def main():
     logger.info("="*60)
     
     # Check GPU
-    device = setup_gpu(logger)
+    setup_gpu(logger)
     
     # Set random seeds for reproducibility
     torch.manual_seed(Config.SEED)

@@ -288,7 +288,7 @@ def main():
                 min_delta=EARLY_STOPPING_MIN_DELTA,
                 mode=mode
             )
-            print(f"\nEarly Stopping: enabled")
+            print("\nEarly Stopping: enabled")
             print(f"  Patience: {EARLY_STOPPING_PATIENCE} epochs")
             print(f"  Min delta: {EARLY_STOPPING_MIN_DELTA}")
             print(f"  Monitoring: {EARLY_STOPPING_METRIC}")

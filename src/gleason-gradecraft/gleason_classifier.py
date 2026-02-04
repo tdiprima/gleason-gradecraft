@@ -457,7 +457,7 @@ def objective(
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Epochs: {epochs}")
     logger.info("  Architecture: ResNet50")
-    logger.info(f"{'='*50}")
+    logger.info("=" * 50)
     
     try:
         # Create data loaders with this batch size

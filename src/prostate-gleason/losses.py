@@ -67,8 +67,8 @@ class FocalLoss(nn.Module):
             return focal_loss.mean()
         elif self.reduction == "sum":
             return focal_loss.sum()
-        else:
-            return focal_loss
+        
+        return focal_loss
 
 
 class LabelSmoothingCrossEntropy(nn.Module):
@@ -125,8 +125,8 @@ class LabelSmoothingCrossEntropy(nn.Module):
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
-        else:
-            return loss
+
+        return loss
 
 
 class ClassBalancedLoss(nn.Module):
@@ -192,9 +192,8 @@ class ClassBalancedLoss(nn.Module):
 
         # Apply class-balanced weights
         alpha_t = self.weights.gather(0, targets)
-        focal_loss = alpha_t * focal_loss
 
-        return focal_loss.mean()
+        return (alpha_t * focal_loss).mean()
 
 
 def get_criterion(
@@ -222,7 +221,7 @@ def get_criterion(
         Loss criterion (nn.Module)
     """
     # Handle label smoothing
-    if label_smoothing > 0 and strategy not in ["focal", "cb_focal"]:
+    if label_smoothing > 0 and strategy not in ("focal", "cb_focal"):
         weight_tensor = None
         if class_weights is not None:
             weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
@@ -233,7 +232,7 @@ def get_criterion(
     if strategy == "none":
         return nn.CrossEntropyLoss()
 
-    elif strategy in ["inverse", "inverse_sqrt", "effective"]:
+    elif strategy in ("inverse", "inverse_sqrt", "effective"):
         if class_weights is None:
             raise ValueError(f"class_weights required for strategy '{strategy}'")
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32)

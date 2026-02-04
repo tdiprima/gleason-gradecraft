@@ -100,7 +100,7 @@ def compute_class_weights(strategy, class_counts, beta=0.999):
     Returns:
         numpy array of class weights, or None for "none"/"focal" strategies
     """
-    if strategy == "none" or strategy == "focal":
+    if strategy in ("none", "focal"):
         return None
 
     total_samples = class_counts.sum()
